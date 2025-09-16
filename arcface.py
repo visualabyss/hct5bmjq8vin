@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, sys, argparse, csv, json, contextlib, io
+import os, sys, argparse, csv, json, contextlib, io, time, warnings
 from pathlib import Path
 import numpy as np
 import cv2
-import time, warnings
 from progress import ProgressBar
 
-# Silence noisy warnings (e.g., numpy/insightface FutureWarning rcond)
+# Silence third‑party FutureWarnings (e.g., insightface numpy lstsq rcond)
+os.environ.setdefault("PYTHONWARNINGS", "ignore::FutureWarning")
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 IMAGE_EXTS={".png",".jpg",".jpeg",".bmp",".webp"}
@@ -23,7 +23,8 @@ USAGE (common)
   python3 -u /workspace/scripts/arcface.py \
     --aligned /workspace/data_src/aligned \
     --logs    /workspace/data_src/logs \
-    --ref_dir /workspace/refs
+    --ref_dir /workspace/refs \
+    --override
 
 CLI FLAGS
   --aligned DIR (req)               aligned images to score
@@ -31,19 +32,19 @@ CLI FLAGS
   --ref_dir DIR (req)               directory of reference images (recursive)
   --model any                       kept for interface parity (ignored)
   --batch INT (64)                  kept for parity; embedding is per-image in this runner
+  --override (flag)                 rewrite arcface.csv instead of appending
 
   # logging & help
   --help on|off (on)                write /workspace/scripts/arcface.txt then proceed
   -h / --h                          print this help text and continue
 
 OUTPUTS
-  logs/arcface/arcface.csv          (append mode; header if file is new) schema: path,id_score
+  logs/arcface/arcface.csv          (append or rewrite if --override) schema: path,id_score
   logs/arcface/embeddings.npy       float32 N×D embeddings (ordered to CSV; D=512)
   logs/arcface/index.csv            row,file,ok (1 if embedded)
   logs/arcface/centroid.npy         float32 D vector (L2-normalized)
   logs/arcface/meta.json            backend, dim, ref_count, fallback flags
 """
-
 
 def _parse_onoff(v, default=False):
     if v is None:
@@ -68,8 +69,7 @@ def _quiet():
 # ---------------- utils ----------------
 
 def list_images(d: Path):
-    xs=[p for p in sorted(d.iterdir()) if p.suffix.lower() in IMAGE_EXTS]
-    return xs
+    return [p for p in sorted(d.iterdir()) if p.suffix.lower() in IMAGE_EXTS]
 
 
 def imread_bgr(p: Path):
@@ -129,9 +129,8 @@ def compute_centroid_from_dir(app, ref_dir: Path):
     ref_paths = [p for p in sorted(ref_dir.rglob('*')) if p.suffix.lower() in IMAGE_EXTS]
     if not ref_paths:
         return None, 0
-    bar = ProgressBar("REFS", total=len(ref_paths), show_fail_label=True, show_fps=False, fail_label="FAIL")
-    embs = []
-    fails = 0
+    bar_refs = ProgressBar("REFS", total=len(ref_paths), show_fail_label=True, show_fps=False, fail_label="FAIL")
+    embs = []; fails = 0
     for i,p in enumerate(ref_paths,1):
         try:
             im = imread_bgr(p)
@@ -142,8 +141,8 @@ def compute_centroid_from_dir(app, ref_dir: Path):
                 embs.append(v)
         except Exception:
             fails += 1
-        bar.update(i, fails=fails)
-    bar.close()
+        bar_refs.update(i, fails=fails)
+    bar_refs.close()
     if not embs:
         return None, 0
     C = l2norm(np.mean(np.stack(embs,0), axis=0))
@@ -158,12 +157,12 @@ def main():
     ap.add_argument('--ref_dir', required=True, type=Path)
     ap.add_argument('--model', default='any')
     ap.add_argument('--batch', type=int, default=64)
+    ap.add_argument('--override', action='store_true')
     ap.add_argument('--help', dest='auto_help', default='on')
     args = ap.parse_args()
 
     if getattr(args, 'show_cli_help', False):
         print(AUTO_HELP_TEXT)
-    # write auto-help file
     try:
         if _parse_onoff(args.auto_help, True):
             sp = Path(__file__).resolve(); (sp.with_name(sp.stem + '.txt')).write_text(AUTO_HELP_TEXT, encoding='utf-8')
@@ -190,9 +189,8 @@ def main():
     centroid, ref_used = compute_centroid_from_dir(app, args.ref_dir)
     fallback_to_aligned = False
     if centroid is None:
-        # Build centroid from aligned set as fallback, still respecting progress UX
         fallback_to_aligned = True
-        bar_fallback = ProgressBar("REFS", total=len(imgs), show_fail_label=True, show_fps=False, fail_label="FAIL")
+        bar_fb = ProgressBar("REFS", total=len(imgs), show_fail_label=True, show_fps=False, fail_label="FAIL")
         embs = []; fails=0
         for i,p in enumerate(imgs,1):
             try:
@@ -204,8 +202,8 @@ def main():
                     embs.append(v)
             except Exception:
                 fails+=1
-            bar_fallback.update(i, fails=fails)
-        bar_fallback.close()
+            bar_fb.update(i, fails=fails)
+        bar_fb.close()
         if not embs:
             print('ARCFACE: no embeddings available (refs and aligned failed).')
             with csv_path.open('w', newline='', encoding='utf-8') as f:
@@ -216,20 +214,16 @@ def main():
 
     # main pass: embed aligned, score, and dump artifacts
     headers=['path','id_score']
-    is_new = not csv_path.exists()
-    if is_new:
+    # override -> rewrite CSV header fresh
+    if args.override or not csv_path.exists():
         with csv_path.open('w', newline='', encoding='utf-8') as f:
             csv.DictWriter(f, fieldnames=headers).writeheader()
-
-    N=len(imgs)
-    D=512
+    N=len(imgs); D=512
     E = np.zeros((N,D), dtype=np.float32)
     OK = np.zeros((N,), dtype=np.uint8)
 
-    # ensure a visible divider before ARCFACE row
     bar_arc = ProgressBar('ARCFACE', total=N, show_fail_label=True, show_fps=True, fail_label='FAIL')
     fails=0
-    t0 = time.time()
     with csv_path.open('a', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=headers)
         for i,p in enumerate(imgs,1):
@@ -246,11 +240,10 @@ def main():
             except Exception:
                 fails += 1
             w.writerow({'path': p.name, 'id_score': score_str})
-            # let progress compute FPS by elapsed time
             bar_arc.update(i, fails=fails)
     bar_arc.close()
 
-    # save artifacts
+    # save artifacts (overwrite is fine)
     try:
         np.save(emb_path, E)
         np.save(cen_path, centroid.astype(np.float32))
@@ -276,7 +269,6 @@ def main():
         pass
 
     return 0
-
 
 if __name__ == '__main__':
     try:

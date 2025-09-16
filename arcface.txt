@@ -1,0 +1,30 @@
+
+PURPOSE
+  • Compute ArcFace embeddings on a reference set to form a normalized centroid, then score each aligned image
+    by cosine similarity to that centroid (higher = closer to refs).
+  • Two progress rows: REFS (no FPS; shows FAIL=rejects) then ARCFACE (FPS + FAIL=embeds failed).
+  • Writes a lean CSV for compatibility and richer artifacts for downstream analysis.
+
+USAGE (common)
+  python3 -u /workspace/scripts/arcface.py \
+    --aligned /workspace/data_src/aligned \
+    --logs    /workspace/data_src/logs \
+    --ref_dir /workspace/refs
+
+CLI FLAGS
+  --aligned DIR (req)               aligned images to score
+  --logs DIR (req)                  log root (outputs under logs/arcface)
+  --ref_dir DIR (req)               directory of reference images (recursive)
+  --model any                       kept for interface parity (ignored)
+  --batch INT (64)                  kept for parity; embedding is per-image in this runner
+
+  # logging & help
+  --help on|off (on)                write /workspace/scripts/arcface.txt then proceed
+  -h / --h                          print this help text and continue
+
+OUTPUTS
+  logs/arcface/arcface.csv          (append mode; header if file is new) schema: path,id_score
+  logs/arcface/embeddings.npy       float32 N×D embeddings (ordered to CSV; D=512)
+  logs/arcface/index.csv            row,file,ok (1 if embedded)
+  logs/arcface/centroid.npy         float32 D vector (L2-normalized)
+  logs/arcface/meta.json            backend, dim, ref_count, fallback flags

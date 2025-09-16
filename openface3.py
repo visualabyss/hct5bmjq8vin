@@ -3,15 +3,10 @@
 """
 OpenFace 3.0 runner — logs/openface3/
 
-Additions (backward compatible):
-- Auto-help: writes /workspace/scripts/openface3.py.txt when --help on|off (default on). -h/--h prints and continues.
-- on|off conversion accepted for boolean-ish flags (still accepts 1/0/true/false and old styles).
-- Extras (opt-in, OFF by default; no changes unless enabled):
-  • --extra_csv on|off → write logs/openface3/openface3_full.csv with all 8 AU values and emotion top-k.
-  • --csv_emotion_topk INT (0) → when >0, include top-k "label:prob" in extra CSV.
-  • --landmarks on|off (off) + --landmarks_fmt {json,pts,both} (json) → save per-image landmarks if available.
-
-Core behavior (detection → multitask → CSV/TSV) unchanged unless extras are enabled.
+Adjustments:
+- Help file name: save as /workspace/scripts/openface3.txt (NOT *.py.txt).
+- De-dupe: don't backfill `confidence` from `emotion_conf` when detector is skipped; leave empty unless detector provides it.
+- Auto-help, on|off normalization, extras remain as previously added.
 """
 
 import os, sys, csv, argparse, traceback, warnings, contextlib, io, inspect, json, itertools, time
@@ -81,7 +76,6 @@ def _to1d(x):
 
 # ---------------- AU calibration ----------------
 def _calibrate_au_index(multitask, of3_root: Path):
-    """Runtime AU index mapping via OF3 images/au/*.png. Returns (map_au_to_idx, matrix, row_margins, score) or None."""
     try:
         au_set = AU_ORDER
         au_dir = of3_root / "images" / "au"
@@ -174,7 +168,7 @@ CLI FLAGS
   --landmarks_fmt {json,pts,both} (json)
 
   # logging & help
-  --help on|off (on)                write /workspace/scripts/openface3.py.txt then proceed
+  --help on|off (on)                write /workspace/scripts/openface3.txt then proceed
   -h / --h                          print this help text and continue
 
 LOG OUTPUT
@@ -203,7 +197,6 @@ for i in it:
         if v in {"on","off"}:  # convert for argparse int parsers if any remain
             sys.argv[i+1] = "1" if v=="on" else "0"
     _newargv.append(a)
-# (we keep sys.argv unchanged length; argparse below uses string types anyway)
 
 
 def parse_args():
@@ -257,7 +250,7 @@ def _write_auto_help(enabled: bool):
         return
     try:
         script_path = Path(__file__).resolve()
-        (script_path.with_suffix('.py.txt')).write_text(AUTO_HELP_TEXT, encoding='utf-8')
+        (script_path.with_name(script_path.stem + '.txt')).write_text(AUTO_HELP_TEXT, encoding='utf-8')
     except Exception:
         pass
 
@@ -398,6 +391,7 @@ def main():
         row.update({"path":str(img), "file":img.name, "success":0})
         try:
             # crop
+            det_conf = None
             if args.skip_detect:
                 crop = cv2.imread(str(img))
                 if crop is None:
@@ -413,7 +407,8 @@ def main():
                     raise RuntimeError("no_face")
                 try:
                     if dets is not None and len(dets)>0 and len(dets[0])>=5:
-                        row["confidence"] = f"{float(dets[0][4]):.4f}"
+                        det_conf = float(dets[0][4])
+                        row["confidence"] = f"{det_conf:.4f}"
                 except Exception:
                     pass
 
@@ -459,7 +454,6 @@ def main():
             # AU logic
             au_map = {}
             if au_v.size == 8:
-                # remap if runtime-calibrated
                 idx = AU_INDEX_RUNTIME or AU_INDEX
                 for n in AU_ORDER:
                     au_map[n] = float(au_v[idx[n]])
@@ -474,8 +468,6 @@ def main():
                     row["teeth"] = "likely"
 
             row["success"] = 1
-            if not row.get("confidence"):
-                row["confidence"] = row.get("emotion_conf") or "0.9900"
 
             # per-image TSV
             if args.per_image:

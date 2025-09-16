@@ -1,0 +1,20 @@
+﻿@'
+# Ignore everything by default
+*
+!*/
+!.gitignore
+!README.md
+# Allow only code/text we care about (recursive)
+!**/*.py
+!**/*.sh
+!**/*.ps1
+!**/*.txt
+!**/*.json
+!**/*.yaml
+!**/*.yml
+'@ | Set-Content .gitignore -Encoding utf8
+
+git rm -r --cached .         # untrack everything (local files untouched)
+git add -A                   # re-add only what whitelist allows
+git commit -m "whitelist: only scripts/text"
+git push -u origin main

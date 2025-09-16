@@ -9,7 +9,8 @@ USAGE (common)
   python3 -u /workspace/scripts/arcface.py \
     --aligned /workspace/data_src/aligned \
     --logs    /workspace/data_src/logs \
-    --ref_dir /workspace/refs
+    --ref_dir /workspace/refs \
+    --override
 
 CLI FLAGS
   --aligned DIR (req)               aligned images to score
@@ -17,13 +18,14 @@ CLI FLAGS
   --ref_dir DIR (req)               directory of reference images (recursive)
   --model any                       kept for interface parity (ignored)
   --batch INT (64)                  kept for parity; embedding is per-image in this runner
+  --override (flag)                 rewrite arcface.csv instead of appending
 
   # logging & help
   --help on|off (on)                write /workspace/scripts/arcface.txt then proceed
   -h / --h                          print this help text and continue
 
 OUTPUTS
-  logs/arcface/arcface.csv          (append mode; header if file is new) schema: path,id_score
+  logs/arcface/arcface.csv          (append or rewrite if --override) schema: path,id_score
   logs/arcface/embeddings.npy       float32 N×D embeddings (ordered to CSV; D=512)
   logs/arcface/index.csv            row,file,ok (1 if embedded)
   logs/arcface/centroid.npy         float32 D vector (L2-normalized)

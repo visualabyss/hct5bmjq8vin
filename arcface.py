@@ -34,6 +34,12 @@ CLI FLAGS
   --batch INT (64)                  kept for parity; embedding is per-image in this runner
   --override (flag)                 rewrite arcface.csv instead of appending
 
+  # reference preprocessing & detection
+  --ref_pad FLOAT (0.60)            reflect-pad fraction around refs before detection
+  --ref_gamma FLOAT (1.35)          gamma correction for refs (1=no change)
+  --ref_clahe on|off (on)           apply CLAHE to L channel for refs
+  --ref_det_thresh FLOAT (0.30)     min detector score for refs
+
   # logging & help
   --help on|off (on)                write /workspace/scripts/arcface.txt then proceed
   -h / --h                          print this help text and continue
@@ -109,12 +115,41 @@ def load_face_app():
             app.prepare(ctx_id=0, det_size=(640,640), det_thresh=0.30)
     return app, providers
 
+# ---------- reference preprocess (to avoid fallback to aligned) ----------
 
-def best_face_embedding(app, img_bgr):
+def _clahe_bgr(im):
+    lab = cv2.cvtColor(im, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    cl = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
+    return cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+
+def _gamma_bgr(im, g=1.0):
+    if g is None or abs(float(g) - 1.0) < 1e-6:
+        return im
+    lut = np.clip(((np.arange(256) / 255.0) ** (1.0 / float(g))) * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return cv2.LUT(im, lut)
+
+def _preprocess_ref(im, pad_frac=0.60, gamma=1.35, clahe=1):
+    if im is None:
+        return None
+    out = im
+    if int(clahe):
+        out = _clahe_bgr(out)
+    if gamma is not None:
+        out = _gamma_bgr(out, float(gamma))
+    H, W = out.shape[:2]
+    pad = int(round(float(pad_frac) * min(H, W)))
+    if pad > 0:
+        out = cv2.copyMakeBorder(out, pad, pad, pad, pad, cv2.BORDER_REFLECT_101)
+    return out
+
+
+def best_face_embedding(app, img_bgr, det_thresh=None):
     faces = app.get(img_bgr) or []
+    if det_thresh is not None:
+        faces = [f for f in faces if float(getattr(f,'det_score',0.0)) >= float(det_thresh)]
     if not faces:
         return None
-    # choose by det score then bbox area
     faces.sort(key=lambda f: (float(getattr(f,'det_score',0.0)), (float(f.bbox[2]-f.bbox[0])*float(f.bbox[3]-f.bbox[1]))), reverse=True)
     emb = getattr(faces[0], 'normed_embedding', None)
     if emb is None:
@@ -125,7 +160,7 @@ def best_face_embedding(app, img_bgr):
     return l2norm(v)
 
 
-def compute_centroid_from_dir(app, ref_dir: Path):
+def compute_centroid_from_dir(app, ref_dir: Path, args):
     ref_paths = [p for p in sorted(ref_dir.rglob('*')) if p.suffix.lower() in IMAGE_EXTS]
     if not ref_paths:
         return None, 0
@@ -134,7 +169,8 @@ def compute_centroid_from_dir(app, ref_dir: Path):
     for i,p in enumerate(ref_paths,1):
         try:
             im = imread_bgr(p)
-            v = best_face_embedding(app, im)
+            im = _preprocess_ref(im, pad_frac=args.ref_pad, gamma=args.ref_gamma, clahe=1 if _parse_onoff(args.ref_clahe, True) else 0)
+            v = best_face_embedding(app, im, det_thresh=args.ref_det_thresh)
             if v is None:
                 fails += 1
             else:
@@ -148,6 +184,7 @@ def compute_centroid_from_dir(app, ref_dir: Path):
     C = l2norm(np.mean(np.stack(embs,0), axis=0))
     return C, len(embs)
 
+# ---------------- main ----------------
 
 def main():
     ap = argparse.ArgumentParser("ArcFace scorer (InsightFace) -> logs/arcface/arcface.csv", add_help=False)
@@ -158,6 +195,10 @@ def main():
     ap.add_argument('--model', default='any')
     ap.add_argument('--batch', type=int, default=64)
     ap.add_argument('--override', action='store_true')
+    ap.add_argument('--ref_pad', type=float, default=0.60)
+    ap.add_argument('--ref_gamma', type=float, default=1.35)
+    ap.add_argument('--ref_clahe', default='on')
+    ap.add_argument('--ref_det_thresh', type=float, default=0.30)
     ap.add_argument('--help', dest='auto_help', default='on')
     args = ap.parse_args()
 
@@ -186,7 +227,7 @@ def main():
     app, providers = load_face_app()
 
     # centroid from refs; fallback to aligned if refs yield none
-    centroid, ref_used = compute_centroid_from_dir(app, args.ref_dir)
+    centroid, ref_used = compute_centroid_from_dir(app, args.ref_dir, args)
     fallback_to_aligned = False
     if centroid is None:
         fallback_to_aligned = True
@@ -214,7 +255,6 @@ def main():
 
     # main pass: embed aligned, score, and dump artifacts
     headers=['path','id_score']
-    # override -> rewrite CSV header fresh
     if args.override or not csv_path.exists():
         with csv_path.open('w', newline='', encoding='utf-8') as f:
             csv.DictWriter(f, fieldnames=headers).writeheader()
@@ -243,7 +283,7 @@ def main():
             bar_arc.update(i, fails=fails)
     bar_arc.close()
 
-    # save artifacts (overwrite is fine)
+    # save artifacts
     try:
         np.save(emb_path, E)
         np.save(cen_path, centroid.astype(np.float32))

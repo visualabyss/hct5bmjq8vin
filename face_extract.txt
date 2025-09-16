@@ -1,0 +1,90 @@
+
+PURPOSE
+  • Sample a video at --fps (default 8), detect faces (InsightFace FaceAnalysis), and save aligned square crops
+    to --out as PNGs named 000001.png, 000002.png, …
+  • If --refs / --refs_dir are given and --sim>0, compute cosine similarity vs reference embeddings and keep a
+    frame only if the BEST face meets sim ≥ --sim (default 0.55).
+  • Crop geometry controls:
+      - anchor: bbox (default), eyes, nose (+ --anchor_offset_y vertical bias)
+      - sizing: square with pad via --bbox_pad (default 0.34)
+      - edges: --edge_policy {shift|pad|skip} (default skip) with --edge_fill and --max_pad_frac
+      - yaw-adaptive horizontal shift (optional): --yaw_shift*
+      - single-face guard: --solo_mode {off|reject|shrink} + thresholds
+  • Quality gates before saving: --min_crop_px, --max_upscale, --min_face_frac_crop,
+    plus legacy blur/brightness guards (Tenengrad & mean gray).
+  • Shows a one-line progress bar with FPS and SAVED count (self-contained via progress.py).
+
+USAGE (common)
+  python3 -u /workspace/scripts/face_extract.py \
+    --video /path/to/video.mp4 \
+    --out   /workspace/data_src/aligned \
+    --fps 8 --size 512 \
+    --refs_dir /workspace/refs --sim 0.55 \
+    --det_size 960 --det_thresh 0.30 \
+    --edge_policy skip --bbox_pad 0.34 \
+    --min_crop_px 512 --max_upscale 1.5 --min_face_frac_crop 0.30
+
+CLI FLAGS
+  --video (req)                  input video path
+  --out   (req)                  output aligned dir
+
+  --refs [files...]              reference face images
+  --refs_dir DIR                 directory of reference images (recursive)
+  --size  INT (512)              output crop size (square)
+  --fps   FLOAT (8.0)            sampling rate (frames per second)
+  --sim   FLOAT (0.55)           min cosine sim vs refs; set 0 to ignore refs
+  --max_per_frame INT (1)        max crops per sampled frame
+
+  # detection / runtime
+  --det_size INT (960)           detection canvas
+  --det_thresh FLOAT (0.30)      detector threshold
+  --low_cpu on|off (off)         reduce threads / prefer CPU provider
+  --ep "trt,cuda,cpu"            execution provider order (ORT providers)
+
+  # crop geometry
+  --anchor {auto,bbox,eyes,nose} (bbox)
+  --anchor_offset_y FLOAT (0.10)
+  --bbox_pad FLOAT (0.34)
+  --edge_policy {shift,pad,skip} (skip)
+  --edge_fill {reflect,replicate,black} (reflect)
+  --max_pad_frac FLOAT (0.18)
+
+  # quality guards
+  --min_crop_px INT (512)
+  --max_upscale FLOAT (1.5)
+  --min_face_frac_crop FLOAT (0.30)
+  --min_bbox_frac FLOAT (0.0)          min face bbox area / frame area
+  --min_tenengrad FLOAT (0.0)          blur gate on pre-resize crop
+  --dark_relax FLOAT (1.0)             relax blur gate if dark
+  --min_brightness FLOAT (0.0)         mean-gray gate
+
+  # references preprocessing
+  --ref_pad FLOAT (0.60)
+  --ref_gamma FLOAT (1.35)
+  --ref_clahe on|off (on)
+  --ref_det_thresh FLOAT (0.30)
+
+  # yaw / multi-face handling
+  --yaw_shift on|off (off)             enable yaw-adaptive shift
+  --yaw_shift_frac FLOAT (0.12)
+  --yaw_shift_yawmax FLOAT (45.0)
+  --solo_mode {off,reject,shrink} (reject)
+  --solo_min_other_frac FLOAT (0.25)
+  --solo_shrink_pad FLOAT (0.18)
+
+  # logging & help
+  --print_every INT (1000)
+  --debug_every INT (0)
+  --log_dir DIR                         where to write video_stats.csv (default parent(--out)/logs/video)
+  --help on|off (on)                    write /workspace/scripts/face_extract.txt then proceed
+
+LOG OUTPUT
+  <logs>/video/video_stats.csv   (append mode; header is written if the file is new)
+
+  Location:
+    • If --log_dir is set → <log_dir>/video/video_stats.csv
+    • Otherwise           → parent(--out)/logs/video/video_stats.csv
+      Example: --out /workspace/data_src/aligned → /workspace/data_src/logs/video/video_stats.csv
+
+  One row per SAVED crop; columns (exact order):
+    file, frame_idx, sim, orig_side, up, face_frac, video_id

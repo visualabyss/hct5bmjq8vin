@@ -1,0 +1,44 @@
+
+PURPOSE
+  • Run MediaPipe Face Landmarker v2 over aligned images and extract: face presence, landmark count,
+    head pose (yaw/pitch/roll from the 4×4 facial transformation matrix), and all 52 facial blendshapes.
+  • Outputs a single CSV row per image and per-image JSON payloads containing full data.
+  • CPU-only, silence-first, single-line progress (via progress.py).
+
+USAGE (common)
+  python3 -u /workspace/scripts/mediapipe.py \
+    --aligned /workspace/data_src/aligned \
+    --logs    /workspace/data_src/logs \
+    --mp_task /workspace/tools/mediapipe/face_landmarker.task \
+    --fps 8 --override
+
+CLI FLAGS
+  # input / IO
+  --aligned DIR (req)               images to process
+  --logs DIR (req)                  log root
+  --mp_task FILE (req)              Face Landmarker v2 .task model
+  --override (flag)                 overwrite CSV header if schema changed
+
+  # runtime
+  --fps INT (8)                     timestamp step (ms = 1000/fps) for detect_for_video
+
+  # logging & help
+  --help on|off (on)                write /workspace/scripts/mediapipe.txt then proceed
+  -h / --h                          print this help text and continue
+
+CSV OUTPUT
+  logs/mediapipe/mp_tags.csv  (append mode; header written if new)
+  Columns (exact order):
+    path, file, presence, landmarks, yaw, pitch, roll,
+    blend::<52 canonical names>, success
+
+PER-IMAGE JSON
+  logs/mediapipe/per_image/<stem>.json (always written)
+  {
+    "file": "000001.png",
+    "presence": 1,
+    "landmarks_2d": [[x,y], ...],             # normalized in [0,1]
+    "blendshapes": {"browInnerUp": 0.12, ...},
+    "matrix_4x4": [[m00,m01,m02,m03], ...],  # row-major
+    "yaw_pitch_roll": [yaw, pitch, roll]
+  }

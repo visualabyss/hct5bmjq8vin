@@ -20,6 +20,12 @@ CLI FLAGS
   --batch INT (64)                  kept for parity; embedding is per-image in this runner
   --override (flag)                 rewrite arcface.csv instead of appending
 
+  # reference preprocessing & detection
+  --ref_pad FLOAT (0.60)            reflect-pad fraction around refs before detection
+  --ref_gamma FLOAT (1.35)          gamma correction for refs (1=no change)
+  --ref_clahe on|off (on)           apply CLAHE to L channel for refs
+  --ref_det_thresh FLOAT (0.30)     min detector score for refs
+
   # logging & help
   --help on|off (on)                write /workspace/scripts/arcface.txt then proceed
   -h / --h                          print this help text and continue

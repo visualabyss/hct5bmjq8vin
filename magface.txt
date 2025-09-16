@@ -1,0 +1,36 @@
+
+PURPOSE
+  • Score face image quality with **MagFace**: quality = L2 norm of the **pre-normalized** embedding.
+  • Accepts either a **Torch checkpoint** (`--ckpt`) which is exported to ONNX on the fly, or a ready **ONNX** model (`--model`).
+  • Runs on ONNX Runtime **GPU** (CUDA provider) in `/workspace/envs/mf_env`.
+  • Outputs a lean CSV and richer artifacts for downstream analysis.
+
+USAGE (common)
+  python3 -u /workspace/scripts/magface.py \
+    --aligned /workspace/data_src/aligned \
+    --logs    /workspace/data_src/logs \
+    --ckpt    /workspace/tools/magface_res100_backbone.pth \
+    --batch 256
+
+  # or, if you already have an ONNX that outputs **pre-norm** embeddings (N×512)
+  python3 -u /workspace/scripts/magface.py \
+    --aligned /workspace/data_src/aligned \
+    --logs    /workspace/data_src/logs \
+    --model   /workspace/tools/magface_export.onnx
+
+CLI FLAGS
+  --aligned DIR (req)               aligned faces dir (112×112 recommended)
+  --logs DIR (req)                  log root (writes logs/magface/*)
+  --ckpt FILE                       MagFace Torch checkpoint (.pth); exported to ONNX if newer than cached export
+  --model FILE                      MagFace ONNX (outputs **pre-norm** embeddings). Ignored if --ckpt is provided
+  --batch INT (256)                 batch size for ONNX inference
+
+  # logging & help
+  --help on|off (on)                write /workspace/scripts/magface.txt then proceed
+  -h / --h                          print this help text and continue
+
+OUTPUTS
+  logs/magface/magface.csv          (append mode; header if new) schema: path,quality
+  logs/magface/embeddings.npy       float32 N×D pre-norm embeddings (ordered to CSV; typically D=512)
+  logs/magface/index.csv            row,file,ok (1 if embedded)
+  logs/magface/meta.json            source (ckpt/model), onnx path, dims, providers, batch, counts

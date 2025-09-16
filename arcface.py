@@ -1,236 +1,294 @@
 #!/usr/bin/env python3
-# --- auto-switch to dedicated ArcFace env (/workspace/envs/af_env) ---
-def _ensure_af_env():
-    import os, sys
-    af_py = "/workspace/envs/af_env/bin/python"
-    if sys.executable != af_py and os.path.exists(af_py):
-        os.environ.setdefault("PYTHONUNBUFFERED", "1")
-        os.execv(af_py, [af_py, os.path.abspath(__file__), *sys.argv[1:]])
-_ensure_af_env()
+# -*- coding: utf-8 -*-
+"""
+ArcFace scoring over aligned images with InsightFace FaceAnalysis.
 
-import sys, csv, argparse, time
+Additions (backward-compatible):
+- Auto-help: writes /workspace/scripts/arcface.txt when --help on|off (default on). -h/--h prints and continues.
+- Two progress rows via progress.py: REFS (no FPS; FAIL shows rejected refs) then ARCFACE (FPS + FAIL counter).
+- Always extract everything useful (no opt-ins):
+  • arcface.csv  — lean, stable: path,id_score (unchanged schema)
+  • embeddings.npy — N×D embeddings in image order (D=512)
+  • index.csv      — row mapping: row,file,ok (1 if embedded)
+  • centroid.npy   — D vector used for scoring (L2-normalized)
+  • meta.json      — backend info, dims, ref_count, fallback flags
+
+Core scoring logic remains the same: cosine similarity to the centroid built from refs (or aligned fallback).
+"""
+
+import os, sys, argparse, csv, json, math, time, contextlib, io
 from pathlib import Path
+import numpy as np
+import cv2
+from progress import ProgressBar
 
-# --- progress bar import (shared style) ---
-try:
-    from progress import ProgressBar
-except Exception:
-    class ProgressBar:
-        def __init__(self, *a, **k): self.total = k.get("total", 1)
-        def update(self, *a, **k): pass
-        def close(self): pass
+IMAGE_EXTS={".png",".jpg",".jpeg",".bmp",".webp"}
 
-# --------------- utils ---------------
-def _prep_dirs(args):
-    aligned = Path(args.aligned)
-    ref_dir = Path(args.ref_dir)
-    logs = Path(args.logs)
-    out_csv = logs / "arcface" / "arcface.csv"
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    return aligned, ref_dir, out_csv
+# ---------------- auto-help ----------------
+AUTO_HELP_TEXT = r"""
+PURPOSE
+  • Compute ArcFace embeddings on a reference set to form a normalized centroid, then score each aligned image
+    by cosine similarity to that centroid (higher = closer to refs).
+  • Two progress rows: REFS (no FPS; shows FAIL=rejects) then ARCFACE (FPS + FAIL=embeds failed).
+  • Writes a lean CSV for compatibility and richer artifacts for downstream analysis.
 
-def _write_csv_header(path: Path):
-    with path.open("w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(["path","id_score"])
+USAGE (common)
+  python3 -u /workspace/scripts/arcface.py \
+    --aligned /workspace/data_src/aligned \
+    --logs    /workspace/data_src/logs \
+    --ref_dir /workspace/refs
 
-def _providers_ort(ort):
-    avail = set(ort.get_available_providers())
-    pref = [p for p in ("CUDAExecutionProvider","CPUExecutionProvider") if p in avail]
-    return pref or ["CPUExecutionProvider"]
+CLI FLAGS
+  --aligned DIR (req)               aligned images to score
+  --logs DIR (req)                  log root (outputs under logs/arcface)
+  --ref_dir DIR (req)               directory of reference images (recursive)
+  --model any                       kept for interface parity (ignored)
+  --batch INT (64)                  kept for parity; embedding is per-image in this runner
 
-def _list_imgs(dir_path):
-    ex = {".jpg",".jpeg",".png",".webp",".bmp"}
-    ps = [p for p in Path(dir_path).glob("*") if p.suffix.lower() in ex]
-    ps.sort()
-    return ps
+  # logging & help
+  --help on|off (on)                write /workspace/scripts/arcface.txt then proceed
+  -h / --h                          print this help text and continue
 
-# -------- ONNX streaming embedder --------
-def _embed_stream_onnx(sess, np, cv2, dir_path, batch, iname):
-    # infer H,W from model
-    H, W = 112, 112
+OUTPUTS
+  logs/arcface/arcface.csv          (append mode; header if file is new) schema: path,id_score
+  logs/arcface/embeddings.npy       float32 N×D embeddings (ordered to CSV; D=512)
+  logs/arcface/index.csv            row,file,ok (1 if embedded)
+  logs/arcface/centroid.npy         float32 D vector (L2-normalized)
+  logs/arcface/meta.json            backend, dim, ref_count, fallback flags
+"""
+
+def _parse_onoff(v, default=False):
+    if v is None:
+        return bool(default)
+    if isinstance(v, (int, float)):
+        return bool(int(v))
+    s = str(v).strip().lower()
+    if s in {"1","on","true","yes","y"}: return True
+    if s in {"0","off","false","no","n"}: return False
+    return bool(default)
+
+@contextlib.contextmanager
+def _quiet():
+    old = (sys.stdout, sys.stderr)
     try:
-        shp = sess.get_inputs()[0].shape
-        if isinstance(shp, (list,tuple)) and len(shp)==4 and all(isinstance(v,int) for v in shp[2:4]):
-            H, W = int(shp[2]), int(shp[3])
-    except Exception:
-        pass
+        buf_out, buf_err = io.StringIO(), io.StringIO()
+        sys.stdout, sys.stderr = buf_out, buf_err
+        yield
+    finally:
+        sys.stdout, sys.stderr = old
 
-    paths = _list_imgs(dir_path)
-    b = max(1, int(batch))
-    for i in range(0, len(paths), b):
-        ims, kept = [], []
-        for pth in paths[i:i+b]:
-            im = cv2.imread(str(pth), cv2.IMREAD_COLOR)
-            if im is None: 
-                continue
-            im = cv2.resize(im, (W, H), interpolation=cv2.INTER_AREA)
-            im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB).astype(np.float32)
-            im = (im - 127.5) / 128.0
-            im = np.transpose(im, (2,0,1))  # NCHW
-            ims.append(im); kept.append(pth.name)
-        if not ims:
-            yield [], None
-            continue
-        inp = _np.stack(ims, axis=0).astype("float32")
-        out = sess.run(None, {iname: inp})[0]
-        out /= (__import__("numpy").linalg.norm(out, axis=1, keepdims=True) + 1e-9)
-        yield kept, out.astype("float32")
+# ---------------- utils ----------------
 
-# -------- FaceAnalysis recognition fallback --------
-def _load_face_recognition(prefer_gpu=True):
+def list_images(d: Path):
+    xs=[p for p in sorted(d.iterdir()) if p.suffix.lower() in IMAGE_EXTS]
+    return xs
+
+
+def imread_bgr(p: Path):
+    data = np.fromfile(str(p), dtype=np.uint8)
+    im = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if im is None:
+        im = cv2.imread(str(p), cv2.IMREAD_COLOR)
+    return im
+
+
+def l2norm(v: np.ndarray, eps=1e-9):
+    n = float(np.linalg.norm(v) + eps)
+    return (v / n).astype(np.float32)
+
+
+def get_available_providers():
     try:
-        from insightface.app import FaceAnalysis
+        import onnxruntime as ort
+        ps = list(ort.get_available_providers())
+        order = ["TensorrtExecutionProvider","CUDAExecutionProvider","CPUExecutionProvider"]
+        return [p for p in order if p in ps] or ps
     except Exception:
-        return None
-    for name in ("buffalo_l","antelopev2"):
+        return ["CPUExecutionProvider"]
+
+
+def load_face_app():
+    os.environ.setdefault('ORT_LOG_SEVERITY_LEVEL','3')
+    os.environ.setdefault('INSIGHTFACE_DISABLE_ANALYTICS','1')
+    from insightface.app import FaceAnalysis
+    providers = get_available_providers()
+    with _quiet():
+        app = FaceAnalysis(name='buffalo_l', providers=providers)
         try:
-            app = FaceAnalysis(name=name, root="/workspace/tools/ifzoo")
-            try:
-                app.prepare(ctx_id=0 if prefer_gpu else -1)
-            except Exception:
-                app.prepare(ctx_id=-1)
-            rec = getattr(app, "models", {}).get("recognition", None)
-            if rec is not None:
-                return rec  # has get_feat(img_bgr_112)
+            app.prepare(ctx_id=0, det_size=(640,640), det_thresh=0.30,
+                        allowed_modules=["detection","recognition","landmark_2d_106"])
+        except TypeError:
+            app.prepare(ctx_id=0, det_size=(640,640), det_thresh=0.30)
+    return app, providers
+
+
+def best_face_embedding(app, img_bgr):
+    faces = app.get(img_bgr) or []
+    if not faces:
+        return None
+    # choose by det score then bbox area
+    faces.sort(key=lambda f: (float(getattr(f,'det_score',0.0)), (float(f.bbox[2]-f.bbox[0])*float(f.bbox[3]-f.bbox[1]))), reverse=True)
+    emb = getattr(faces[0], 'normed_embedding', None)
+    if emb is None:
+        return None
+    v = np.asarray(emb, dtype=np.float32).reshape(-1)
+    if v.size == 0:
+        return None
+    return l2norm(v)
+
+
+def compute_centroid_from_dir(app, ref_dir: Path):
+    ref_paths = [p for p in sorted(ref_dir.rglob('*')) if p.suffix.lower() in IMAGE_EXTS]
+    if not ref_paths:
+        return None, 0
+    bar = ProgressBar("REFS", total=len(ref_paths), show_fail_label=True, show_fps=False, fail_label="FAIL")
+    embs = []
+    fails = 0
+    for i,p in enumerate(ref_paths,1):
+        try:
+            im = imread_bgr(p)
+            v = best_face_embedding(app, im)
+            if v is None:
+                fails += 1
+            else:
+                embs.append(v)
         except Exception:
-            continue
-    return None
-
-def _embed_stream_face(recognizer, dir_path, batch):
-    import cv2
-    import numpy as _np
-    paths = _list_imgs(dir_path)
-    b = max(1, int(batch))
-    for i in range(0, len(paths), b):
-        feats, kept = [], []
-        for pth in paths[i:i+b]:
-            im = cv2.imread(str(pth), cv2.IMREAD_COLOR)
-            if im is None: 
-                continue
-            im = cv2.resize(im, (112,112), interpolation=cv2.INTER_AREA)  # recognizer expects 112×112 BGR
-            f = recognizer.get_feat(im)
-            if f is None:
-                continue
-            v = _np.asarray(f, dtype="float32").reshape(-1)
-            v /= (float((v**2).sum())**0.5 + 1e-9)
-            feats.append(v); kept.append(pth.name)
-        if not feats:
-            yield [], None
-        else:
-            yield kept, _np.stack(feats, axis=0).astype("float32")
-
-
-
+            fails += 1
+        bar.update(i, fails=fails)
+    bar.close()
+    if not embs:
+        return None, 0
+    C = l2norm(np.mean(np.stack(embs,0), axis=0))
+    return C, len(embs)
 
 
 def main():
-    import os, time, csv, argparse
-    import numpy as np, cv2, warnings
-    # Silence warnings/logs
-    os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
-    warnings.filterwarnings("ignore")
-    np.seterr(all="ignore")
+    ap = argparse.ArgumentParser("ArcFace scorer (InsightFace) -> logs/arcface/arcface.csv", add_help=False)
+    ap.add_argument('-h','--h', dest='show_cli_help', action='store_true')
+    ap.add_argument('--aligned', required=True, type=Path)
+    ap.add_argument('--logs', required=True, type=Path)
+    ap.add_argument('--ref_dir', required=True, type=Path)
+    ap.add_argument('--model', default='any')
+    ap.add_argument('--batch', type=int, default=64)
+    ap.add_argument('--help', dest='auto_help', default='on')
+    args = ap.parse_args()
+
+    if getattr(args, 'show_cli_help', False):
+        print(AUTO_HELP_TEXT)
+    # write auto-help file
     try:
-        import onnxruntime as _ort
-        if hasattr(_ort, "set_default_logger_severity"):
-            _ort.set_default_logger_severity(4)  # FATAL
+        if _parse_onoff(args.auto_help, True):
+            sp = Path(__file__).resolve(); (sp.with_name(sp.stem + '.txt')).write_text(AUTO_HELP_TEXT, encoding='utf-8')
     except Exception:
         pass
 
-    ap = argparse.ArgumentParser(description="ArcFace (FaceAnalysis-only) per-frame scoring with live CSV")
-    ap.add_argument("--aligned", required=True)
-    ap.add_argument("--logs",    required=True)
-    ap.add_argument("--model",   required=True)   # kept for interface parity
-    ap.add_argument("--ref_dir", required=True)
-    ap.add_argument("--batch",   type=int, default=64)  # unused (per-frame), kept for CLI parity
-    args = ap.parse_args()
+    imgs = list_images(args.aligned)
+    out_dir = args.logs / 'arcface'; out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / 'arcface.csv'
+    emb_path = out_dir / 'embeddings.npy'
+    idx_path = out_dir / 'index.csv'
+    cen_path = out_dir / 'centroid.npy'
+    meta_path = out_dir / 'meta.json'
 
-    aligned, ref_dir, out_csv = _prep_dirs(args)
-    ref_paths = _list_imgs(str(ref_dir))
-    src_paths = _list_imgs(str(aligned))
+    if not imgs:
+        print('ARCFACE: no images under --aligned.')
+        with csv_path.open('w', newline='', encoding='utf-8') as f:
+            csv.DictWriter(f, fieldnames=['path','id_score']).writeheader()
+        return 2
 
-    # Header immediately
-    _write_csv_header(out_csv)
-    f = out_csv.open("a", newline="", encoding="utf-8")
-    w = csv.writer(f)
+    app, providers = load_face_app()
 
-    # Load recognition backend
-    rec = _load_face_recognition(prefer_gpu=True)
-    if rec is None:
-        print("[ERR] FaceAnalysis recognition unavailable. Leaving CSV header only.")
-        f.close(); return 0
+    # centroid from refs; fallback to aligned if refs yield none
+    centroid, ref_used = compute_centroid_from_dir(app, args.ref_dir)
+    fallback_to_aligned = False
+    if centroid is None:
+        # Build centroid from aligned set as fallback, still respecting progress UX
+        fallback_to_aligned = True
+        bar = ProgressBar("REFS", total=len(imgs), show_fail_label=True, show_fps=False, fail_label="FAIL")
+        embs = []; fails=0
+        for i,p in enumerate(imgs,1):
+            try:
+                im = imread_bgr(p)
+                v = best_face_embedding(app, im)
+                if v is None:
+                    fails+=1
+                else:
+                    embs.append(v)
+            except Exception:
+                fails+=1
+            bar.update(i, fails=fails)
+        bar.close()
+        if not embs:
+            print('ARCFACE: no embeddings available (refs and aligned failed).')
+            with csv_path.open('w', newline='', encoding='utf-8') as f:
+                csv.DictWriter(f, fieldnames=['path','id_score']).writeheader()
+            return 2
+        centroid = l2norm(np.mean(np.stack(embs,0), axis=0))
+        ref_used = len(embs)
 
-    def embed_one(path):
-        try:
-            im = cv2.imread(path, cv2.IMREAD_COLOR)
-            if im is None: return None
-            im = cv2.resize(im, (112,112), interpolation=cv2.INTER_AREA)  # expects BGR 112
-            feat = rec.get_feat(im)
-            if feat is None: return None
-            v = np.asarray(feat, dtype=np.float32).reshape(-1)
-            v /= (np.linalg.norm(v) + 1e-9)
-            return v
-        except Exception:
-            return None
+    # main pass: embed aligned, score, and dump artifacts
+    headers=['path','id_score']
+    is_new = not csv_path.exists()
+    if is_new:
+        with csv_path.open('w', newline='', encoding='utf-8') as f:
+            csv.DictWriter(f, fieldnames=headers).writeheader()
 
-    # Build centroid from refs — label REFS, show FAIL C counter, update per-frame
-    total_ref = max(1, len(ref_paths))
-    p_ref = ProgressBar("REFS", total=total_ref)
-    sum_vec = np.zeros((512,), dtype=np.float32); n_ref = 0; ref_fail = 0
-    t0 = time.time()
-    for i, pth in enumerate(ref_paths, 1):
-        v = embed_one(str(pth))
-        if v is not None:
-            sum_vec += v; n_ref += 1
-        else:
-            ref_fail += 1
-        fps = 0 if (time.time()-t0)<=0 else i/(time.time()-t0)
-        p_ref.update(i, fails=ref_fail, fps=fps)   # FAIL C= printed by progress.py
-    p_ref.close()
+    N=len(imgs)
+    D=512
+    E = np.zeros((N,D), dtype=np.float32)
+    OK = np.zeros((N,), dtype=np.uint8)
 
-    # If no refs, use aligned as refs (still label as REFS)
-    if n_ref == 0:
-        total_ref = max(1, len(src_paths))
-        p_ref = ProgressBar("REFS", total=total_ref)
-        sum_vec[...] = 0; n_ref = 0; ref_fail = 0; t0 = time.time()
-        for i, pth in enumerate(src_paths, 1):
-            v = embed_one(str(pth))
-            if v is not None:
-                sum_vec += v; n_ref += 1
-            else:
-                ref_fail += 1
-            fps = 0 if (time.time()-t0)<=0 else i/(time.time()-t0)
-            p_ref.update(i, fails=ref_fail, fps=fps)
-        p_ref.close()
+    bar2 = ProgressBar('ARCFACE', total=N, show_fail_label=True, show_fps=True, fail_label='FAIL')
+    fails=0
+    with csv_path.open('a', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=headers)
+        for i,p in enumerate(imgs,1):
+            score_str=''
+            try:
+                im = imread_bgr(p)
+                v = best_face_embedding(app, im)
+                if v is not None:
+                    OK[i-1]=1; E[i-1]=v
+                    score = float(np.dot(v, centroid))
+                    score_str = f'{score:.6f}'
+                else:
+                    fails += 1
+            except Exception:
+                fails += 1
+            w.writerow({'path': p.name, 'id_score': score_str})
+            bar2.update(i, fails=fails)
+    bar2.close()
 
-    if n_ref == 0:
-        print("[ERR] No reference embeddings. Leaving CSV header only.")
-        f.close(); return 0
+    # save artifacts
+    try:
+        np.save(emb_path, E)
+        np.save(cen_path, centroid.astype(np.float32))
+        with idx_path.open('w', newline='', encoding='utf-8') as f:
+            iw = csv.writer(f); iw.writerow(['row','file','ok'])
+            for i,p in enumerate(imgs):
+                iw.writerow([i, p.name, int(OK[i])])
+        meta = {
+            'backend': 'insightface.app.FaceAnalysis',
+            'model': 'buffalo_l',
+            'providers': providers,
+            'dim': int(D),
+            'ref_count': int(ref_used),
+            'fallback_centroid_from_aligned': bool(fallback_to_aligned),
+            'aligned_count': int(N),
+            'embeddings_path': str(emb_path),
+            'centroid_path': str(cen_path),
+            'index_path': str(idx_path),
+            'csv_path': str(csv_path),
+        }
+        meta_path.write_text(json.dumps(meta, indent=2), encoding='utf-8')
+    except Exception:
+        pass
 
-    centroid = sum_vec / float(n_ref)
-    centroid /= (np.linalg.norm(centroid) + 1e-9)
-
-    # Score aligned — label ARCFACE, show FAIL C, flush every row, per-frame update
-    total_src = max(1, len(src_paths))
-    p_src = ProgressBar("ARCFACE", total=total_src)
-    t0 = time.time()
-    wrote = 0; src_fail = 0
-    for i, pth in enumerate(src_paths, 1):
-        v = embed_one(str(pth))
-        if v is not None:
-            sc = float(np.dot(v, centroid))
-            w.writerow([pth.name, f"{sc:.6f}"])
-            f.flush()
-            wrote += 1
-        else:
-            src_fail += 1
-        fps = 0 if (time.time()-t0)<=0 else i/(time.time()-t0)
-        p_src.update(i, fails=src_fail, fps=fps)
-    p_src.close()
-    f.close()
-    print(f"[OK] wrote {wrote} rows → {out_csv}")
     return 0
 
-if __name__ == "__main__":
-    sys.exit(main())
-PY
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

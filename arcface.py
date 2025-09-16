@@ -1,30 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-ArcFace scoring over aligned images with InsightFace FaceAnalysis.
-
-Additions (backward-compatible):
-- Auto-help: writes /workspace/scripts/arcface.txt when --help on|off (default on). -h/--h prints and continues.
-- Two progress rows via progress.py: REFS (no FPS; FAIL shows rejected refs) then ARCFACE (FPS + FAIL counter).
-- Always extract everything useful (no opt-ins):
-  • arcface.csv  — lean, stable: path,id_score (unchanged schema)
-  • embeddings.npy — N×D embeddings in image order (D=512)
-  • index.csv      — row mapping: row,file,ok (1 if embedded)
-  • centroid.npy   — D vector used for scoring (L2-normalized)
-  • meta.json      — backend info, dims, ref_count, fallback flags
-
-Core scoring logic remains the same: cosine similarity to the centroid built from refs (or aligned fallback).
-"""
-
-import os, sys, argparse, csv, json, math, time, contextlib, io
+import os, sys, argparse, csv, json, contextlib, io
 from pathlib import Path
 import numpy as np
 import cv2
+import time, warnings
 from progress import ProgressBar
+
+# Silence noisy warnings (e.g., numpy/insightface FutureWarning rcond)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 IMAGE_EXTS={".png",".jpg",".jpeg",".bmp",".webp"}
 
-# ---------------- auto-help ----------------
 AUTO_HELP_TEXT = r"""
 PURPOSE
   • Compute ArcFace embeddings on a reference set to form a normalized centroid, then score each aligned image
@@ -56,6 +43,7 @@ OUTPUTS
   logs/arcface/centroid.npy         float32 D vector (L2-normalized)
   logs/arcface/meta.json            backend, dim, ref_count, fallback flags
 """
+
 
 def _parse_onoff(v, default=False):
     if v is None:
@@ -204,7 +192,7 @@ def main():
     if centroid is None:
         # Build centroid from aligned set as fallback, still respecting progress UX
         fallback_to_aligned = True
-        bar = ProgressBar("REFS", total=len(imgs), show_fail_label=True, show_fps=False, fail_label="FAIL")
+        bar_fallback = ProgressBar("REFS", total=len(imgs), show_fail_label=True, show_fps=False, fail_label="FAIL")
         embs = []; fails=0
         for i,p in enumerate(imgs,1):
             try:
@@ -216,8 +204,8 @@ def main():
                     embs.append(v)
             except Exception:
                 fails+=1
-            bar.update(i, fails=fails)
-        bar.close()
+            bar_fallback.update(i, fails=fails)
+        bar_fallback.close()
         if not embs:
             print('ARCFACE: no embeddings available (refs and aligned failed).')
             with csv_path.open('w', newline='', encoding='utf-8') as f:
@@ -238,8 +226,10 @@ def main():
     E = np.zeros((N,D), dtype=np.float32)
     OK = np.zeros((N,), dtype=np.uint8)
 
-    bar2 = ProgressBar('ARCFACE', total=N, show_fail_label=True, show_fps=True, fail_label='FAIL')
+    # ensure a visible divider before ARCFACE row
+    bar_arc = ProgressBar('ARCFACE', total=N, show_fail_label=True, show_fps=True, fail_label='FAIL')
     fails=0
+    t0 = time.time()
     with csv_path.open('a', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=headers)
         for i,p in enumerate(imgs,1):
@@ -256,8 +246,9 @@ def main():
             except Exception:
                 fails += 1
             w.writerow({'path': p.name, 'id_score': score_str})
-            bar2.update(i, fails=fails)
-    bar2.close()
+            # let progress compute FPS by elapsed time
+            bar_arc.update(i, fails=fails)
+    bar_arc.close()
 
     # save artifacts
     try:

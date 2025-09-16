@@ -1,0 +1,37 @@
+
+PURPOSE
+  • Run OpenSeeFace facetracker on an aligned image sequence (compiled to MJPG) and record per-frame signals.
+  • Extracted signals:
+      - Head pose (yaw, pitch, roll), translation (tx, ty, tz), blinkL/blinkR, tracker confidence & fit error,
+        PnP error, and per-stage timings (proc/detect/crop/track/points3d) from stdout.
+      - UDP stream values (timestamp, face_id, width, height, yaw/pitch/roll, tx/ty/tz, blink L/R, pnp_error,
+        quaternion raw [q0,q1,q2,q3]).
+  • Outputs:
+      - logs/openseeface/osf_tags.csv (append/refresh; one row per image in order).
+      - logs/openseeface/per_image/<stem>.json (always) with full payload merged from stdout + UDP.
+  • One-line progress via progress.py (dividers handled globally).
+
+USAGE (common)
+  python3 -u /workspace/scripts/openseeface.py \
+    --aligned /workspace/data_src/aligned \
+    --logs    /workspace/data_src/logs \
+    --osf_root /workspace/tools/OpenSeeFace \
+    --py /workspace/envs/osf_env/bin/python \
+    --compile on --fps 8 --override
+
+CLI FLAGS
+  # input / IO
+  --aligned DIR (req)               aligned image directory
+  --logs DIR (req)                  log root (CSV + per-image JSON under logs/openseeface)
+  --osf_root DIR (req)              OpenSeeFace repo root containing facetracker.py
+  --py FILE                         Python interpreter for OSF (default: current)
+  --override (flag)                 rewrite CSV header if schema changed
+
+  # runtime
+  --fps INT (8)                     FPS for the temporary MJPG video
+  --compile on|off (on)             build MJPG from images (accepts on/off/1/0/true/false)
+  --udp_port INT (11573)            UDP port to listen for OSF stream
+
+  # logging & help
+  --help on|off (on)                write /workspace/scripts/openseeface.txt then proceed
+  -h / --h                          print this help text and continue

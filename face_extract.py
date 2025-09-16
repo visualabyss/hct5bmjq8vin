@@ -3,17 +3,10 @@
 """
 face_extract.py — renamed from extract_face_directly.py
 
-Changes per DeepFaceLabs 3 governance (no core logic changes):
-- Progress UI via progress.py with two rows:
-    REFS    → shows FAIL count of rejected refs (no FPS)
-    EXTRACT → shows FACE = number of saved frames (with FPS)
-- Logging path: logs/video/video_stats.csv (append-only; header if new)
-  Columns (exact order): file,frame_idx,sim,orig_side,up,face_frac,video_id
-- Silence framework/provider/model chatter (no duplicate REFS row; no EP spam)
-- Auto-help: writes /workspace/scripts/face_extract.py.txt on start (unless disabled)
-- CLI accepts on/off/1/0 for relevant flags; legacy aliases preserved where possible
-
-NOTE: Core extraction/detection/cropping/quality gates remain unchanged.
+Surgical cleanup (no core logic changes):
+- Auto-help filename: write /workspace/scripts/face_extract.txt (not *.py.txt).
+- Remove manual divider prints; dividers now handled by progress.py by default.
+- Keep ETA alignment via progress.py; keep warning suppression.
 """
 
 import argparse, sys, time, math, os, csv, shutil
@@ -25,7 +18,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Use shared progress style
 from progress import ProgressBar
-DIV = "======================================================================================================="
 
 # ---------------------------
 # COMPAT: legacy args shims
@@ -417,7 +409,7 @@ CLI FLAGS
   --print_every INT (1000)
   --debug_every INT (0)
   --log_dir DIR                         where to write video_stats.csv (default parent(--out)/logs/video)
-  --help on|off (on)                    write /workspace/scripts/face_extract.py.txt then proceed
+  --help on|off (on)                    write /workspace/scripts/face_extract.txt then proceed
 
 LOG OUTPUT
   <logs>/video/video_stats.csv   (append mode; header is written if the file is new)
@@ -442,7 +434,6 @@ def _parse_onoff(v, default=False):
         return True
     if s in {"0","off","false","no","n"}:
         return False
-    # fallback: presence means on
     return bool(default)
 
 
@@ -513,13 +504,12 @@ def parse_args():
     ap.add_argument("--print_every", type=int, default=1000)
     ap.add_argument("--debug_every", type=int, default=0)
     ap.add_argument("--log_dir", default=None, help="Directory to write video_stats.csv (default parent(--out)/logs/video)")
-    ap.add_argument("--help", dest="auto_help", default="on", help="on|off — write face_extract.py.txt then proceed")
+    ap.add_argument("--help", dest="auto_help", default="on", help="on|off — write face_extract.txt then proceed")
 
     return ap.parse_args()
 
 # --------------------- Logging helper --------------------
 def _open_log(out_dir: Path, video_path: str, log_dir: str|None=None):
-    # logs root
     logs_root = (Path(log_dir).resolve() if log_dir else (out_dir.parent / 'logs'))
     video_dir = logs_root / 'video'
     video_dir.mkdir(parents=True, exist_ok=True)
@@ -573,7 +563,6 @@ def _apply_low_cpu():
 
 
 def _select_providers(args):
-    # Map tokens -> ORT names; do not print
     try:
         import onnxruntime as ort
         avail = list(ort.get_available_providers())
@@ -596,7 +585,6 @@ def _select_providers(args):
 # ---- end helpers ----
 
 def _normalize_args(args):
-    # normalize on/off to bool/int as needed
     args.low_cpu = _parse_onoff(getattr(args, 'low_cpu', 'off'), default=False)
     args.ref_clahe = 1 if _parse_onoff(getattr(args, 'ref_clahe', 'on'), default=True) else 0
     args.yaw_shift = 1 if _parse_onoff(getattr(args, 'yaw_shift', 'off'), default=False) else 0
@@ -608,7 +596,7 @@ def _write_auto_help(script_path: Path, enabled=True):
     if not enabled:
         return
     try:
-        out_txt = script_path.with_suffix('.py.txt')
+        out_txt = script_path.with_name(script_path.stem + '.txt')
         out_txt.write_text(AUTO_HELP_TEXT, encoding='utf-8')
     except Exception:
         pass
@@ -621,7 +609,7 @@ def _embed_refs_with_bar(app, ref_paths, args):
     if not ref_paths:
         return None
 
-    bar = ProgressBar(label="REFS   ", total=len(ref_paths), show_fail_label=True, show_fps=False, fail_label="FAIL")
+    bar = ProgressBar(label="REFS", total=len(ref_paths), show_fail_label=True, show_fps=False, fail_label="FAIL")
     ref_vecs = []
     fails = 0
     for i, rp in enumerate(ref_paths, 1):
@@ -657,11 +645,9 @@ def main():
 
     args = parse_args()
     if getattr(args, 'show_cli_help', False):
-        # user asked for CLI help; print and continue (do not exit)
         print(AUTO_HELP_TEXT)
     args = _normalize_args(args)
 
-    # optional: low CPU
     if args.low_cpu:
         _apply_low_cpu()
 
@@ -676,7 +662,6 @@ def main():
     try:
         _log_f, _log_w, _video_id = _open_log(out_dir, args.video, args.log_dir)
     except Exception as _e:
-        # keep going silently
         pass
 
     # Init InsightFace quietly
@@ -695,9 +680,7 @@ def main():
     ref_paths = _collect_ref_paths(args)
     ref_mat = None
     if ref_paths and float(getattr(args, 'sim', 0.0)) > 0.0:
-        print(DIV)
         ref_mat = _embed_refs_with_bar(app, ref_paths, args)
-        print(DIV)
 
     # Stats (unchanged semantics)
     stats = {
@@ -736,13 +719,11 @@ def main():
     except Exception:
         total_frames = 0
     samp_total = ((total_frames + step - 1) // step) if total_frames > 0 else 0
-    print(DIV)
     bar = ProgressBar(label="EXTRACT", total=max(1, samp_total), show_fail_label=True, fail_label="FACE", show_fps=True)
 
     count = 0
     processed_samples = 0
     frame_idx = -1
-    t0 = time.time()
 
     while True:
         ok, frame = cap.read()
@@ -760,7 +741,6 @@ def main():
             bar.update(processed_samples, fails=count)  # FACE shows number of saved frames
             continue
 
-        # choose face (by refs if provided)
         sim_val = -1.0
         if ref_mat is not None and args.sim > 0:
             face, sim_val = _best_by_similarity(faces, ref_mat)
@@ -771,7 +751,6 @@ def main():
         else:
             face = _pick_best_face(faces, W, H)
 
-        # bbox area fraction guard
         if float(args.min_bbox_frac) > 0.0:
             x1,y1,x2,y2 = map(float, face.bbox)
             bbox_frac = ((x2 - x1) * (y2 - y1)) / float(W * H)
@@ -780,7 +759,6 @@ def main():
                 bar.update(processed_samples, fails=count)
                 continue
 
-        # anchor + yaw-adaptive shift
         cx_det, cy_det, side_det = _get_anchor(face, args.anchor, args.anchor_offset_y, W, H)
         if args.yaw_shift:
             yaw = _estimate_yaw_deg_from_kps(face)
@@ -789,10 +767,8 @@ def main():
             cx_det = cx_det + direction * (frac * side_det)
             cx_det = max(0.0, min(cx_det, W - 1.0))
 
-        # base square side (with pad)
         side_use = side_det * (1.0 + 2.0 * float(args.bbox_pad))
 
-        # Solo-face guard: reject or shrink if another face intrudes
         if args.solo_mode != 'off':
             if _other_face_in_crop(faces, face, cx_det, cy_det, side_use, args.solo_min_other_frac):
                 if args.solo_mode == 'reject':
@@ -808,7 +784,6 @@ def main():
                     else:
                         side_use = side_try
 
-        # crop according to edge policy
         crop, edge_reason = extract_square_centered(frame, cx_det, cy_det, side_use, args)
         if crop is None:
             if edge_reason == "skip_edge":
@@ -820,14 +795,12 @@ def main():
             bar.update(processed_samples, fails=count)
             continue
 
-        # face must not be too tiny in crop
         face_frac = side_det / max(1e-6, side_use)
         if float(args.min_face_frac_crop) > 0.0 and face_frac < float(args.min_face_frac_crop):
             stats["face_small_frac"] += 1
             bar.update(processed_samples, fails=count)
             continue
 
-        # Quality: brightness + Tenengrad on pre-resize crop
         if float(args.min_brightness) > 0.0:
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             mg = float(np.mean(gray))
@@ -847,7 +820,6 @@ def main():
                 bar.update(processed_samples, fails=count)
                 continue
 
-        # PRE-RESIZE checks
         orig_side = max(crop.shape[:2])
         if orig_side < int(args.min_crop_px):
             stats["native_too_small"] += 1
@@ -860,7 +832,6 @@ def main():
             bar.update(processed_samples, fails=count)
             continue
 
-        # resize + save PNG
         crop = resize_square(crop, args.size)
         count += 1
         stats["saved"] = count
@@ -868,7 +839,6 @@ def main():
         buf = cv2.imencode('.png', crop)[1]
         buf.tofile(str(out_path))
 
-        # append to video_stats.csv
         try:
             if _log_w is not None:
                 _log_w.writerow({
@@ -883,21 +853,11 @@ def main():
         except Exception:
             pass
 
-        # progress update (FACE shows saved count)
         bar.update(processed_samples, fails=count)
 
     cap.release()
     bar.close()
 
-    print(DIV)
-
-    try:
-        if _log_f is not None:
-            _log_f.close()
-    except Exception:
-        pass
-
-    # --------- End-of-run stats ---------
     up_arr = list(saved_up)
     os_arr = list(saved_orig_side)
     ff_arr = list(saved_face_frac)

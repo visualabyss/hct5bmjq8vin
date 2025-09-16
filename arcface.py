@@ -1,4 +1,3 @@
-cat > /workspace/scripts/arcface.py <<'EOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -293,5 +292,3 @@ if __name__ == '__main__':
         sys.exit(main())
     except KeyboardInterrupt:
         sys.exit(130)
-EOF
-chmod +x /workspace/scripts/arcface.py

@@ -20,9 +20,12 @@ import argparse, sys, time, math, os, csv, shutil
 from pathlib import Path
 import cv2
 import numpy as np
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Use shared progress style
 from progress import ProgressBar
+DIV = "======================================================================================================="
 
 # ---------------------------
 # COMPAT: legacy args shims
@@ -35,8 +38,7 @@ for _i, _a in enumerate(list(sys.argv)):
         sys.argv[_i] = '--log_dir=' + _a.split('=',1)[1]
 
 # --- [MSCALE SHIM START] ---
-# Accept --mscale FLOAT even if argparse doesn't know it, and remove it from argv.
-# Then monkey-patch InsightFace FaceAnalysis.get() to retry at det_size*x when no faces are found.
+# Parse optional --mscale from argv, but delay any InsightFace patching until after import.
 __MSCALE_SHIM__ = True
 import sys as _sys
 __MSCALE = 1.0
@@ -52,25 +54,24 @@ for i,a in enumerate(_sys.argv):
                 __MSCALE = float(_sys.argv[i+1])
             except Exception:
                 pass
-        _skip = True  # skip the value
-        # drop "--mscale"
+        _skip = True
         continue
     if a.startswith("--mscale="):
         try:
             __MSCALE = float(a.split("=",1)[1])
         except Exception:
             pass
-        # drop the arg entirely
         continue
     _newargv.append(a)
 _sys.argv = _newargv
 
-# Try to patch FaceAnalysis.get so it retries at higher scale only when no faces are found.
-try:
-    import cv2 as _cv2
-    from insightface.app import FaceAnalysis as _FA
-    _orig_get = _FA.get
-    if not hasattr(_FA, "_mscale_patched"):
+def _patch_mscale_on_faceanalysis(FaceAnalysis):
+    """Patch FaceAnalysis.get to retry at scaled resolution when no faces found. Silent (no prints)."""
+    try:
+        import cv2 as _cv2
+        _orig_get = FaceAnalysis.get
+        if getattr(FaceAnalysis, "_mscale_patched", False):
+            return
         def _patched_get(self, img, *args, **kwargs):
             faces = _orig_get(self, img, *args, **kwargs)
             try:
@@ -84,7 +85,6 @@ try:
                     return faces
                 faces2 = _orig_get(self, img2, *args, **kwargs)
                 if faces2:
-                    # map boxes/landmarks back to original scale
                     for f in faces2:
                         try:
                             f.bbox = f.bbox / s
@@ -96,13 +96,10 @@ try:
                             pass
                     return faces2
             return faces
-        _FA.get = _patched_get
-        _FA._mscale_patched = True
-        if (globals().get("__MSCALE", 1.0) or 1.0) > 1.0:
-            print(f"[MSCALE] Fallback enabled: x{globals()['__MSCALE']:.2f} when base detection finds no faces.")
-except Exception as _e:
-    # Non-fatal: if InsightFace isn't imported yet, later imports still see the patched class
-    pass
+        FaceAnalysis.get = _patched_get
+        FaceAnalysis._mscale_patched = True
+    except Exception:
+        pass
 # --- [MSCALE SHIM END] ---
 
 # -------------------------
@@ -624,7 +621,7 @@ def _embed_refs_with_bar(app, ref_paths, args):
     if not ref_paths:
         return None
 
-    bar = ProgressBar(label="REFS", total=len(ref_paths), show_fail_label=True, show_fps=False, fail_label="FAIL")
+    bar = ProgressBar(label="REFS   ", total=len(ref_paths), show_fail_label=True, show_fps=False, fail_label="FAIL")
     ref_vecs = []
     fails = 0
     for i, rp in enumerate(ref_paths, 1):
@@ -685,6 +682,7 @@ def main():
     # Init InsightFace quietly
     providers_list = _select_providers(args)
     from insightface.app import FaceAnalysis
+    _patch_mscale_on_faceanalysis(FaceAnalysis)
     with _Quiet():
         app = FaceAnalysis(name="buffalo_l", providers=providers_list)
         try:
@@ -697,7 +695,9 @@ def main():
     ref_paths = _collect_ref_paths(args)
     ref_mat = None
     if ref_paths and float(getattr(args, 'sim', 0.0)) > 0.0:
+        print(DIV)
         ref_mat = _embed_refs_with_bar(app, ref_paths, args)
+        print(DIV)
 
     # Stats (unchanged semantics)
     stats = {
@@ -736,6 +736,7 @@ def main():
     except Exception:
         total_frames = 0
     samp_total = ((total_frames + step - 1) // step) if total_frames > 0 else 0
+    print(DIV)
     bar = ProgressBar(label="EXTRACT", total=max(1, samp_total), show_fail_label=True, fail_label="FACE", show_fps=True)
 
     count = 0
@@ -887,6 +888,8 @@ def main():
 
     cap.release()
     bar.close()
+
+    print(DIV)
 
     try:
         if _log_f is not None:

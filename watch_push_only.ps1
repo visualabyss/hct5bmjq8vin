@@ -2,56 +2,70 @@ param(
   [string]$Dir = "E:\AI\DeepFaceLab\scripts",
   [string]$Remote = "origin",
   [string]$Branch = "main",
-  [int]$Quiet = 5,            # debounce seconds
-  [int]$MinPush = 20,         # don't push more often than this
-  [int]$Poll = 60,            # periodic check even if no FS event
-  [string]$Log = "E:\AI\DeepFaceLab\scripts\.pushwatch.log",
-  [string]$Pid = "E:\AI\DeepFaceLab\scripts\.pushwatch.pid"
+  [int]$Quiet = 5,              # debounce seconds
+  [int]$MinPush = 20,           # min seconds between pushes
+  [int]$Poll = 60,              # periodic poll
+  [string]$LogPath = "E:\AI\DeepFaceLab\scripts\.pushwatch.log",
+  [string]$PidFilePath = "E:\AI\DeepFaceLab\scripts\.pushwatch.pid"
 )
 
-function Log($m){$t=(Get-Date).ToString("s");"$t  $m" | Tee-Object -FilePath $Log -Append}
+function Log($m){$t=(Get-Date).ToString("s");"$t  $m" | Tee-Object -FilePath $LogPath -Append}
 
+# ---- preflight ----
+if (-not (Test-Path $Dir)) { throw "Dir not found: $Dir" }
 Set-Location $Dir
-git config push.default current      | Out-Null   # never pulls
-git config pull.rebase false         | Out-Null   # belt & suspenders
+if (-not (Test-Path ".git")) { throw "This folder is not a git repo. Run git init & add remote first." }
+$remoteUrl = git remote get-url $Remote 2>$null
+if (-not $remoteUrl) { throw "Remote '$Remote' not found. Add with: git remote add origin https://github.com/<you>/<repo>.git" }
+
+git config push.default current  | Out-Null   # push only; never pull
+git config pull.rebase false     | Out-Null
 
 # single-instance guard
-if (Test-Path $Pid) {
-  $old = Get-Content $Pid -ErrorAction SilentlyContinue
+if (Test-Path $PidFilePath) {
+  $old = Get-Content $PidFilePath -ErrorAction SilentlyContinue
   if ($old -and (Get-Process -Id ([int]$old) -ErrorAction SilentlyContinue)) { throw "Watcher already running (PID $old)" }
 }
-$PID | Out-File $Pid -Encoding ascii
+$PID | Out-File $PidFilePath -Encoding ascii
 
+# file system watcher
 $fsw = New-Object IO.FileSystemWatcher $Dir, "*.*"
 $fsw.IncludeSubdirectories = $true
 $fsw.NotifyFilter = [IO.NotifyFilters]'FileName,LastWrite,Size,DirectoryName'
 $fsw.EnableRaisingEvents = $true
 
-$q = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
-$act = { param($s,$e) $q.Enqueue($e) }
+# simple event queue
+$queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+$onEvent = { param($s,$e) $queue.Enqueue($e) }
 $subs = @(
-  Register-ObjectEvent $fsw Changed -Action $act,
-  Register-ObjectEvent $fsw Created -Action $act,
-  Register-ObjectEvent $fsw Deleted -Action $act,
-  Register-ObjectEvent $fsw Renamed -Action $act
+  Register-ObjectEvent $fsw Changed -Action $onEvent,
+  Register-ObjectEvent $fsw Created -Action $onEvent,
+  Register-ObjectEvent $fsw Deleted -Action $onEvent,
+  Register-ObjectEvent $fsw Renamed -Action $onEvent
 )
 
 $lastPush = Get-Date "2000-01-01"
 $lastPoll = Get-Date "2000-01-01"
-Log "Push-only watcher started. Repo: $(git remote get-url $Remote)"
+Log "Push-only watcher started. Repo: $remoteUrl"
 
 try {
   while ($true) {
     Start-Sleep -Seconds $Quiet
     $need = $false
-    if (-not $q.IsEmpty) { while ($q.TryDequeue([ref]$null)){}; $need = $true; Log "FS changes detected" }
-    if (((Get-Date)-$lastPoll).TotalSeconds -ge $Poll) { $lastPoll=Get-Date; $need=$true; Log "Polling..." }
+
+    if (-not $queue.IsEmpty) { while ($queue.TryDequeue([ref]$null)) { } ; $need = $true ; Log "FS changes detected" }
+    if (((Get-Date)-$lastPoll).TotalSeconds -ge $Poll) { $lastPoll = Get-Date ; $need = $true ; Log "Polling..." }
 
     if ($need) {
-      # Stage all changes (whitelist in .gitignore controls what gets tracked)
+      # Stage everything; .gitignore whitelist controls what actually gets tracked
       git add -A 2>$null
       $st = git status --porcelain
-      if ($st) { Log "Committing..."; git commit -m ("auto: "+(Get-Date -Format s)) | Out-Null } else { Log "No changes" }
+      if ($st) {
+        Log "Committing..."
+        git commit -m ("auto: " + (Get-Date -Format s)) | Out-Null
+      } else {
+        Log "No changes"
+      }
 
       if (((Get-Date)-$lastPush).TotalSeconds -ge $MinPush) {
         try {
@@ -60,7 +74,7 @@ try {
           $lastPush = Get-Date
           Log "Push OK"
         } catch {
-          # No fetch or pull. If remote rejected (you are sole pusher), force-with-lease only updates remote.
+          # Still push-only: update remote if it diverged; never pull or checkout locally
           Log "Non-fast-forward; force-with-lease"
           git push --force-with-lease $Remote HEAD:$Branch | Out-Null
           $lastPush = Get-Date
@@ -73,8 +87,8 @@ try {
   }
 }
 finally {
-  foreach ($s in $subs){ Unregister-Event -SourceIdentifier $s.Name -ErrorAction SilentlyContinue }
+  foreach ($s in $subs) { Unregister-Event -SourceIdentifier $s.Name -ErrorAction SilentlyContinue }
   $fsw.EnableRaisingEvents = $false; $fsw.Dispose()
-  Remove-Item $Pid -ErrorAction SilentlyContinue
+  Remove-Item $PidFilePath -ErrorAction SilentlyContinue
   Log "Watcher stopped"
 }

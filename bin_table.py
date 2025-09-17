@@ -3,8 +3,12 @@
 """
 Unified ASCII bin-table renderer shared by tag.py and match.py.
 - Exact display names/labels match your samples (bin_table.txt / bin_table_match.txt).
-- Progress bars; fixed separators; single-space field gaps.
+- 16-char bars; fixed separators; single-space field gaps.
 - MATCH view supports DUPE totals and per-row dupes; hidden when dedupe is off.
+
+Implementation note: to avoid any shell/clipboard newline corruption, we never
+concatenate strings with a trailing opening quote before a newline. We always
+write the newline via a separate write('\\n').
 """
 from __future__ import annotations
 from pathlib import Path
@@ -91,19 +95,20 @@ def render_bin_table(
     fails     = int(totals.get("fails", 0))
 
     buf = io.StringIO()
+
     # header block
-    buf.write(_sep('=' ) + "
-")
-    buf.write(_sep('=' ) + "
-")
+    buf.write(_sep('='))
+    buf.write('\n')
+    buf.write(_sep('='))
+    buf.write('\n')
     buf.write(_hdr_line(mode, processed, max(1, total), fails,
                         dupe_totals if mode == "MATCH" else None,
-                        fps, eta, title=mode) + "
-")
-    buf.write(_sep('=' ) + "
-")
-    buf.write(_sep('=' ) + "
-")
+                        fps, eta, title=mode))
+    buf.write('\n')
+    buf.write(_sep('='))
+    buf.write('\n')
+    buf.write(_sep('='))
+    buf.write('\n')
 
     for sec in SECTION_ORDER:
         data = sections.get(sec, {}) or {}
@@ -113,23 +118,23 @@ def render_bin_table(
         # section header
         buf.write(_section_hdr_line(sec, max(1, total), counts, fails=0,
                                     mode=mode, dupe_totals=dupe_totals,
-                                    dedupe_on=dedupe_on) + "
-")
-        buf.write(_sep('-') + "
-")
+                                    dedupe_on=dedupe_on))
+        buf.write('\n')
+        buf.write(_sep('-'))
+        buf.write('\n')
 
         # rows
         for label, cnt in counts.items():
             dupe_row = dupes_map.get(label) if (mode == "MATCH" and dedupe_on) else None
             buf.write(_row_line(label, max(1, total), int(cnt), mode=mode,
-                                dedupe_on=dedupe_on, dupe_row=dupe_row) + "
-")
+                                dedupe_on=dedupe_on, dupe_row=dupe_row))
+            buf.write('\n')
 
         # section trailer
-        buf.write(_sep('=') + "
-")
-        buf.write(_sep('=') + "
-")
+        buf.write(_sep('='))
+        buf.write('\n')
+        buf.write(_sep('='))
+        buf.write('\n')
 
     return buf.getvalue()
 
@@ -164,8 +169,7 @@ try:
     help_path = Path(__file__).with_suffix('.txt')
     if not help_path.exists():
         help_path.write_text(
-            "Shared bin-table renderer. Sections: GAZE, EYES, MOUTH, SMILE, EMOTION, YAW, PITCH, IDENTITY, QUALITY, TEMP, EXPOSURE.
-",
+            "Shared bin-table renderer. Sections: GAZE, EYES, MOUTH, SMILE, EMOTION, YAW, PITCH, IDENTITY, QUALITY, TEMP, EXPOSURE.\n",
             encoding='utf-8')
 except Exception:
     pass

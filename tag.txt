@@ -11,6 +11,6 @@ FLAGS
   --openseeface on|off (on)        include OpenSeeFace readers if present
   --arcface on|off (on)            include ArcFace readers if present
   --magface on|off (off)           include MagFace readers if present
-  --override on|off (off)          overwrite manifest.jsonl instead of appending
+  --override (flag)                overwrite manifest.jsonl instead of appending
   --help on|off (on)               write /workspace/scripts/tag.txt then proceed
   -h / --h                         print this help text and continue

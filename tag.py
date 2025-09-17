@@ -9,7 +9,7 @@ TAG: fuse tool outputs → human-friendly bins, live bin_table.txt, and manifest
 from __future__ import annotations
 import os, sys, csv, json, time, argparse, math
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional
 import numpy as np
 import cv2
 
@@ -134,7 +134,7 @@ def _estimate_temp_exposure(bgr: np.ndarray):
     sdr = bgr.astype(np.float64)/255.0
     low = float(((sdr[...,0][m] < 0.02).mean() + (sdr[...,1][m] < 0.02).mean() + (sdr[...,2][m] < 0.02).mean())*100/3)
     hi  = float(((sdr[...,0][m] > 0.98).mean() + (sdr[...,1][m] > 0.98).mean() + (sdr[...,2][m] > 0.98).mean())*100/3)
-    exp_bin = "OVER" if (hi > 2.0 and log_avg > 0.65) else ("UNDER" if (low > 2.0 and log_avg < 0.15) else "NORMAL")
+    exp_bin = "OVER" if (hi > 1.0 and log_avg > 0.58) else ("UNDER" if (low > 4.0 and log_avg < 0.12) else "NORMAL")
     return cct, temp_bin, exp_bin
 
 # ---------------- fusion ----------------
@@ -142,9 +142,11 @@ def _estimate_temp_exposure(bgr: np.ndarray):
 def _fuse_gaze(of3: Dict[str,str]):
     gy = _to_float(of3.get('pose_yaw'))
     gp = _to_float(of3.get('pose_pitch'))
-    if gy is None or gp is None:
+    if gy is None and gp is None:
         return None, None
-    return float(gy*180.0/math.pi), float(gp*180.0/math.pi)
+    gy_deg = float(gy*180.0/math.pi) if gy is not None else None
+    gp_deg = float(gp*180.0/math.pi) if gp is not None else None
+    return gy_deg, gp_deg
 
 
 def _eyes_state(mp: Dict[str,str], osf: Dict[str,str]) -> str:
@@ -190,7 +192,15 @@ def _mouth_bins(of3: Dict[str,str], mp: Dict[str,str], au_thr: Dict[str,float]):
 
 
 def _gaze_bin(gy: Optional[float], gp: Optional[float]) -> str:
-    if gy is None or gp is None: return "FRONT"
+    # robust to missing one component
+    if gy is None and gp is None:
+        return "FRONT"
+    if gp is None:
+        if abs(gy) <= 12.0: return "FRONT"
+        return "LEFT" if gy < 0 else "RIGHT"
+    if gy is None:
+        if abs(gp) <= 10.0: return "FRONT"
+        return "UP" if gp > 0 else "DOWN"
     if abs(gy) <= 12.0 and abs(gp) <= 10.0: return "FRONT"
     return ("LEFT" if gy < 0 else "RIGHT") if abs(gy) >= abs(gp) else ("UP" if gp > 0 else "DOWN")
 
@@ -274,17 +284,28 @@ def main():
         print("TAG: no images under --aligned.")
         return 2
 
-    # readers
+    # readers (DEEP MERGE per file)
     src_maps: Dict[str, Dict[str, Dict[str,str]]] = {}
     if use_of3:
         of3a = _read_csv_map(logs/"openface3"/"openface3.csv")
         of3b = _read_csv_map(logs/"openface3"/"openface3_full.csv")
-        m = dict(of3a); m.update(of3b); src_maps['of3'] = m
+        m = {}
+        for k in set(list(of3a.keys()) + list(of3b.keys())):
+            row = {}
+            if k in of3a: row.update(of3a[k])
+            if k in of3b: row.update(of3b[k])
+            m[k] = row
+        src_maps['of3'] = m
     if use_mp:
-        p = None
-        for cand in (logs/"mediapipe"/"mediapipe.csv", logs/"mediapipe"/"mp_tags.csv"):
-            if cand.exists(): p = cand; break
-        src_maps['mp'] = _read_csv_map(p) if p else {}
+        mp_a = _read_csv_map(logs/"mediapipe"/"mediapipe.csv") if (logs/"mediapipe"/"mediapipe.csv").exists() else {}
+        mp_b = _read_csv_map(logs/"mediapipe"/"mp_tags.csv") if (logs/"mediapipe"/"mp_tags.csv").exists() else {}
+        mp_m = {}
+        for k in set(list(mp_a.keys()) + list(mp_b.keys())):
+            row = {}
+            if k in mp_a: row.update(mp_a[k])
+            if k in mp_b: row.update(mp_b[k])
+            mp_m[k] = row
+        src_maps['mp'] = mp_m
     if use_osf:
         src_maps['osf'] = _read_csv_map(logs/"openseeface"/"osf_tags.csv")
     if use_af:
@@ -416,7 +437,7 @@ def main():
             if emo:
                 lbl = str(emo).strip().upper()
                 if lbl == 'SURPRISE': lbl = 'SUPRISE'
-                if emo_conf is None or emo_conf >= 0.60:
+                if emo_conf is None or emo_conf >= 0.35:
                     if lbl in sections['EMOTION']['counts']:
                         sections['EMOTION']['counts'][lbl] += 1
                         emo_lbl = lbl

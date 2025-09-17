@@ -556,8 +556,8 @@ def main():
             }
             try:
                 with open(manifest_path, 'a', encoding='utf-8') as out:
-                    out.write(json.dumps(rec, ensure_ascii=False) + "
-")
+                    out.write(json.dumps(rec, ensure_ascii=False) + '
+')
             except Exception:
                 fails += 1
 

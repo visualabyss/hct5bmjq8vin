@@ -32,7 +32,7 @@ text = render_bin_table(
     eta="MM:SS" or None,
 )
 
-write_bin_table(log_dir, text)  # atomically writes bin_table.txt
+write_bin_table(log_dir, text)  # atomic when possible; safe fallback if file is open in another app
 """
 from __future__ import annotations
 from pathlib import Path
@@ -70,8 +70,6 @@ def _hdr_line(mode: str, processed: int, total: int, fails: int,
               title: str) -> str:
     pct = _pct(processed, total)
     bar = _bar(pct)
-    # TAG:  TAG |bar| pct  processed/total  FAIL X   FPS ETA 00:00
-    # MATCH:MATCH |bar| pct processed/total  FAIL X  DUPE K  FPS ETA 00:00
     base = f"{title:<11}|{bar}| {pct:6.1f}% {processed}/{total} FAIL {fails}"
     if mode == "MATCH" and dupe_totals is not None:
         base += f" DUPE {dupe_totals}"
@@ -96,8 +94,6 @@ def _row_line(label: str, total: int, count: int,
               mode: str, dedupe_on: bool, dupe_row: Optional[int]) -> str:
     pct = _pct(count, total)
     bar = _bar(pct)
-    # TAG:   LABEL |bar| pct count
-    # MATCH: LABEL |bar| pct count dupe
     if mode == "MATCH" and dedupe_on and dupe_row is not None:
         return f"{label:<12}|{bar}| {pct:6.1f}% {count} {dupe_row}"
     else:
@@ -113,61 +109,82 @@ def render_bin_table(
     fps: Optional[int] = None,
     eta: Optional[str] = None,
 ) -> str:
-    """Return full table text for bin_table.txt.
-    - mode: "TAG" or "MATCH"
-    - totals: {processed,total,fails}
-    - sections: {SECTION: {"counts": {LABEL: n, ...}, "dupes": {LABEL: k, ...}?}}
-    - dupe_totals: total dupes (only used for MATCH header/section headers)
-    - dedupe_on: hide DUPE fields entirely when False
-    """
     mode = (mode or "TAG").upper()
     processed = int(totals.get("processed", 0))
     total     = int(totals.get("total", 0))
     fails     = int(totals.get("fails", 0))
 
     buf = io.StringIO()
-    # Top separators + global header
-    buf.write(_sep("=") + "\n")
-    buf.write(_sep("=") + "\n")
-    buf.write(_hdr_line(mode, processed, max(1,total), fails, dupe_totals if mode=="MATCH" else None, fps, eta, title=mode) + "\n")
-    buf.write(_sep("=") + "\n")
-    buf.write(_sep("=") + "\n")
+    buf.write(_sep("=") + "
+")
+    buf.write(_sep("=") + "
+")
+    buf.write(_hdr_line(mode, processed, max(1,total), fails, dupe_totals if mode=="MATCH" else None, fps, eta, title=mode) + "
+")
+    buf.write(_sep("=") + "
+")
+    buf.write(_sep("=") + "
+")
 
-    # Iterate sections in canonical order; ignore missing
     for sec in SECTION_ORDER:
         data = sections.get(sec, {}) or {}
         counts: Dict[str,int] = {k.upper(): int(v) for k,v in (data.get("counts", {}) or {}).items()}
         dupes_map: Dict[str,int] = {k.upper(): int(v) for k,v in (data.get("dupes", {}) or {}).items()}
 
-        # Section header
-        buf.write(_section_hdr_line(sec, max(1,total), counts, fails=0, mode=mode, dupe_totals=dupe_totals, dedupe_on=dedupe_on) + "\n")
-        buf.write(_sep("-") + "\n")
+        buf.write(_section_hdr_line(sec, max(1,total), counts, fails=0, mode=mode, dupe_totals=dupe_totals, dedupe_on=dedupe_on) + "
+")
+        buf.write(_sep("-") + "
+")
 
-        # Child rows in provided order
         for label, cnt in counts.items():
             dupe_row = dupes_map.get(label) if (mode=="MATCH" and dedupe_on) else None
-            buf.write(_row_line(label, max(1,total), int(cnt), mode=mode, dedupe_on=dedupe_on, dupe_row=dupe_row) + "\n")
+            buf.write(_row_line(label, max(1,total), int(cnt), mode=mode, dedupe_on=dedupe_on, dupe_row=dupe_row) + "
+")
 
-        # Between sections separator
-        buf.write(_sep("=") + "\n")
-        buf.write(_sep("=") + "\n")
+        buf.write(_sep("=") + "
+")
+        buf.write(_sep("=") + "
+")
 
     return buf.getvalue()
 
 
 def write_bin_table(log_dir: Path|str, text: str) -> None:
+    """Write bin_table.txt atomically when possible.
+    When the destination is held open by another program (e.g., Notepad on Windows host
+    via a bind mount), rename can fail with PermissionError. In that case, fall back to
+    direct overwrite to keep live-updating behavior.
+    """
     out = Path(log_dir) / "bin_table.txt"
-    tmp = out.with_suffix(".txt.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, out)
+    tmp = out.with_suffix(".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        try:
+            os.replace(tmp, out)
+            return
+        except PermissionError:
+            # Fallback: direct overwrite of the destination
+            with open(out, 'w', encoding='utf-8') as f:
+                f.write(text)
+            try:
+                tmp.unlink()
+            except Exception:
+                pass
+    except Exception:
+        # Last resort: try direct write anyway
+        try:
+            with open(out, 'w', encoding='utf-8') as f:
+                f.write(text)
+        except Exception:
+            pass
 
-
-# Optional: write a tiny help file once (kept silent during normal runs)
+# Optional: write a tiny help file once
 try:
     help_path = Path(__file__).with_suffix('.txt')
     if not help_path.exists():
         help_path.write_text(
-            "Shared bin-table renderer. Sections: GAZE, EYES, MOUTH, SMILE, EMOTION, YAW, PITCH, IDENTITY, QUALITY, TEMP, EXPOSURE.\n",
+            "Shared bin-table renderer. Sections: GAZE, EYES, MOUTH, SMILE, EMOTION, YAW, PITCH, IDENTITY, QUALITY, TEMP, EXPOSURE.
+",
             encoding='utf-8')
 except Exception:
     pass

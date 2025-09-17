@@ -12,6 +12,8 @@
 !**/*.json
 !**/*.yaml
 !**/*.yml
+!**/*.png
+!**/*.avi
 '@ | Set-Content .gitignore -Encoding utf8
 
 git rm -r --cached .         # untrack everything (local files untouched)

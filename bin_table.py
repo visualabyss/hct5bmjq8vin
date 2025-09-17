@@ -14,20 +14,11 @@ text = render_bin_table(
     mode="TAG",                                  # or "MATCH"
     totals={"processed": N, "total": M, "fails": F},
     sections={                                     # order matters; use keys below
-        "GAZE":      {"counts": {"FRONT": a, "LEFT": b, ...}},
-        "EYES":      {"counts": {...}},
-        "MOUTH":     {"counts": {...}},
-        "SMILE":     {"counts": {...}},
-        "EMOTION":   {"counts": {...}},
-        "YAW":       {"counts": {...}},
-        "PITCH":     {"counts": {...}},
-        "IDENTITY":  {"counts": {...}},
-        "QUALITY":   {"counts": {...}},
-        "TEMP":      {"counts": {...}},
-        "EXPOSURE":  {"counts": {...}},
+        "GAZE":      {"counts": {"FRONT": a, "LEFT": b}},
+        # ... other sections ...
     },
     dupe_totals=K,                                 # only used when mode=="MATCH"
-    dedupe_on=True,                                 # if False, hide DUPE fields entirely
+    dedupe_on=True,                                # if False, hide DUPE fields entirely
     fps=FPS_or_None,
     eta="MM:SS" or None,
 )
@@ -53,11 +44,11 @@ SECTION_ORDER = [
 def _bar(pct: float) -> str:
     pct = 0.0 if pct != pct else max(0.0, min(100.0, pct))  # clamp; NaN->0
     filled = int(round(BAR_WIDTH * pct / 100.0))
-    return "█"*filled + " "*(BAR_WIDTH - filled)
+    return ("█" * filled) + (" " * (BAR_WIDTH - filled))
 
 
-def _sep(ch: str="=") -> str:
-    return ch*SEP_LEN
+def _sep(ch: str = "=") -> str:
+    return ch * SEP_LEN
 
 
 def _pct(count: int, total: int) -> float:
@@ -78,7 +69,7 @@ def _hdr_line(mode: str, processed: int, total: int, fails: int,
     return base
 
 
-def _section_hdr_line(name: str, total: int, counts: Dict[str,int],
+def _section_hdr_line(name: str, total: int, counts: Dict[str, int],
                        fails: int, mode: str, dupe_totals: Optional[int],
                        dedupe_on: bool) -> str:
     csum = int(sum(int(v) for v in counts.values()))
@@ -103,67 +94,68 @@ def _row_line(label: str, total: int, count: int,
 def render_bin_table(
     mode: str,
     totals: Dict[str, Any],
-    sections: Dict[str, Dict[str, Dict[str,int]]],
+    sections: Dict[str, Dict[str, Dict[str, int]]],
     dupe_totals: Optional[int] = None,
     dedupe_on: bool = True,
     fps: Optional[int] = None,
     eta: Optional[str] = None,
 ) -> str:
+    """Return full table text for bin_table.txt.
+    - mode: "TAG" or "MATCH"
+    - totals: {processed,total,fails}
+    - sections: {SECTION: {"counts": {LABEL: n, ...}, "dupes": {LABEL: k, ...}?}}
+    - dupe_totals: total dupes (only used for MATCH header/section headers)
+    - dedupe_on: hide DUPE fields entirely when False
+    """
     mode = (mode or "TAG").upper()
     processed = int(totals.get("processed", 0))
     total     = int(totals.get("total", 0))
     fails     = int(totals.get("fails", 0))
 
     buf = io.StringIO()
-    buf.write(_sep("=") + "
-")
-    buf.write(_sep("=") + "
-")
-    buf.write(_hdr_line(mode, processed, max(1,total), fails, dupe_totals if mode=="MATCH" else None, fps, eta, title=mode) + "
-")
-    buf.write(_sep("=") + "
-")
-    buf.write(_sep("=") + "
-")
+    buf.write(_sep("=") + "\n")
+    buf.write(_sep("=") + "\n")
+    buf.write(_hdr_line(mode, processed, max(1, total), fails,
+                        dupe_totals if mode == "MATCH" else None,
+                        fps, eta, title=mode) + "\n")
+    buf.write(_sep("=") + "\n")
+    buf.write(_sep("=") + "\n")
 
     for sec in SECTION_ORDER:
         data = sections.get(sec, {}) or {}
-        counts: Dict[str,int] = {k.upper(): int(v) for k,v in (data.get("counts", {}) or {}).items()}
-        dupes_map: Dict[str,int] = {k.upper(): int(v) for k,v in (data.get("dupes", {}) or {}).items()}
+        counts: Dict[str, int] = {k.upper(): int(v) for k, v in (data.get("counts", {}) or {}).items()}
+        dupes_map: Dict[str, int] = {k.upper(): int(v) for k, v in (data.get("dupes", {}) or {}).items()}
 
-        buf.write(_section_hdr_line(sec, max(1,total), counts, fails=0, mode=mode, dupe_totals=dupe_totals, dedupe_on=dedupe_on) + "
-")
-        buf.write(_sep("-") + "
-")
+        buf.write(_section_hdr_line(sec, max(1, total), counts, fails=0,
+                                    mode=mode, dupe_totals=dupe_totals,
+                                    dedupe_on=dedupe_on) + "\n")
+        buf.write(_sep("-") + "\n")
 
         for label, cnt in counts.items():
-            dupe_row = dupes_map.get(label) if (mode=="MATCH" and dedupe_on) else None
-            buf.write(_row_line(label, max(1,total), int(cnt), mode=mode, dedupe_on=dedupe_on, dupe_row=dupe_row) + "
-")
+            dupe_row = dupes_map.get(label) if (mode == "MATCH" and dedupe_on) else None
+            buf.write(_row_line(label, max(1, total), int(cnt), mode=mode,
+                                dedupe_on=dedupe_on, dupe_row=dupe_row) + "\n")
 
-        buf.write(_sep("=") + "
-")
-        buf.write(_sep("=") + "
-")
+        buf.write(_sep("=") + "\n")
+        buf.write(_sep("=") + "\n")
 
     return buf.getvalue()
 
 
-def write_bin_table(log_dir: Path|str, text: str) -> None:
+def write_bin_table(log_dir: Path | str, text: str) -> None:
     """Write bin_table.txt atomically when possible.
     When the destination is held open by another program (e.g., Notepad on Windows host
     via a bind mount), rename can fail with PermissionError. In that case, fall back to
     direct overwrite to keep live-updating behavior.
     """
     out = Path(log_dir) / "bin_table.txt"
-    tmp = out.with_suffix(".tmp")
+    tmp = out.with_suffix('.tmp')
     try:
         tmp.write_text(text, encoding="utf-8")
         try:
             os.replace(tmp, out)
             return
         except PermissionError:
-            # Fallback: direct overwrite of the destination
             with open(out, 'w', encoding='utf-8') as f:
                 f.write(text)
             try:
@@ -171,7 +163,6 @@ def write_bin_table(log_dir: Path|str, text: str) -> None:
             except Exception:
                 pass
     except Exception:
-        # Last resort: try direct write anyway
         try:
             with open(out, 'w', encoding='utf-8') as f:
                 f.write(text)
@@ -183,8 +174,7 @@ try:
     help_path = Path(__file__).with_suffix('.txt')
     if not help_path.exists():
         help_path.write_text(
-            "Shared bin-table renderer. Sections: GAZE, EYES, MOUTH, SMILE, EMOTION, YAW, PITCH, IDENTITY, QUALITY, TEMP, EXPOSURE.
-",
+            "Shared bin-table renderer. Sections: GAZE, EYES, MOUTH, SMILE, EMOTION, YAW, PITCH, IDENTITY, QUALITY, TEMP, EXPOSURE.\n",
             encoding='utf-8')
 except Exception:
     pass

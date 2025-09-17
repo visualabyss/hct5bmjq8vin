@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+TAG: fusion → bins + live bin_table + manifest streaming.
+- Uses OF3/MediaPipe/OSF/ArcFace/MagFace when available.
+- Face-only temp/exposure; human-friendly bin labels; per-image bin_score.
+- --override is a flag; auto-help writes tag.txt.
+"""
 from __future__ import annotations
 import os, sys, csv, json, time, argparse, math
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
-import numpy as np, cv2
+import numpy as np
+import cv2
 from progress import ProgressBar
-from bin_table import render_bin_table
+from bin_table import render_bin_table, write_bin_table
 
 IMAGE_EXTS={".png",".jpg",".jpeg",".bmp",".webp"}
 GAZE_LABELS=["FRONT","LEFT","RIGHT","UP","DOWN"]
@@ -22,7 +29,11 @@ TEMP_LABELS=["WARM","NEUTRAL","COOL"]
 EXPOSURE_LABELS=["UNDER","NORMAL","OVER"]
 AU_KEYS=["1","2","4","6","9","12","25","26"]
 
-SRGB2XYZ = np.array([[0.4124564,0.3575761,0.1804375],[0.2126729,0.7151522,0.0721750],[0.0193339,0.1191920,0.9503041]],dtype=np.float64)
+SRGB2XYZ = np.array([[0.4124564,0.3575761,0.1804375],
+                     [0.2126729,0.7151522,0.0721750],
+                     [0.0193339,0.1191920,0.9503041]],dtype=np.float64)
+
+# ---- utils ------------------------------------------------------------
 
 def _onoff(v, default=False)->bool:
     if isinstance(v,bool): return v
@@ -35,8 +46,7 @@ def _onoff(v, default=False)->bool:
 
 
 def _list_images(d:Path):
-    xs=[p for p in sorted(d.iterdir()) if p.suffix.lower() in IMAGE_EXTS]
-    return xs
+    return [p for p in sorted(d.iterdir()) if p.suffix.lower() in IMAGE_EXTS]
 
 
 def _read_csv_map(path:Path, key_cols=("file","path","name")):
@@ -114,12 +124,10 @@ def _fuse_gaze(of3):
 
 
 def _eyes_state(mp, osf):
-    # prefer MediaPipe blendshape keys (namespaced)
     ebl=_to_float(mp.get('blend::eyeBlinkLeft') or mp.get('eyeBlinkLeft'))
     ebr=_to_float(mp.get('blend::eyeBlinkRight') or mp.get('eyeBlinkRight'))
     open_l=1.0-ebl if ebl is not None else None
     open_r=1.0-ebr if ebr is not None else None
-    # OSF override if strong blink
     bl=_to_float(osf.get('blink_l')); br=_to_float(osf.get('blink_r'))
     if bl is not None and bl>0.60: open_l=min(open_l or 0.0,0.1)
     if br is not None and br>0.60: open_r=min(open_r or 0.0,0.1)
@@ -199,6 +207,8 @@ FLAGS
   -h / --h                         print this help text and continue
 """
 
+# ---- main -------------------------------------------------------------
+
 def main():
     ap=argparse.ArgumentParser(add_help=False)
     ap.add_argument('-h','--h',dest='show_cli_help',action='store_true')
@@ -240,8 +250,9 @@ def main():
     if use_mf:  src_maps['mf']=_read_csv_map(logs/'magface'/'magface.csv')
     src_maps['fx']=_read_csv_map(logs/'video'/'video_stats.csv')
 
+    # calibrations
     def _calib_id(af):
-        vals=[_to_float(v.get('id_score')) for v in af.values()] if af else []
+        vals=[_to_float(v.get('id_score')) for v in (af or {}).values()]
         vals=[x for x in vals if x is not None]
         if len(vals)<16: return 0.55
         th=float(np.quantile(np.array(vals),0.10)); return float(np.clip(th,0.50,0.80))
@@ -307,12 +318,13 @@ def main():
 
             gyaw_deg,gpitch_deg=_fuse_gaze(of3)
 
+            # prefer OSF pose; fallback to MP/OF3-derived
             yaw=_to_float(osf.get('yaw'))
             pitch=_to_float(osf.get('pitch'))
-            if yaw is None: yaw = _to_float(mp.get('yaw')) if mp else None
-            if pitch is None: pitch = _to_float(mp.get('pitch')) if mp else None
-            if yaw is None and gyaw_deg is not None: yaw = gyaw_deg
-            if pitch is None and gpitch_deg is not None: pitch = gpitch_deg
+            if yaw is None: yaw=_to_float(mp.get('yaw')) if mp else None
+            if pitch is None: pitch=_to_float(mp.get('pitch')) if mp else None
+            if yaw is None and gyaw_deg is not None: yaw=gyaw_deg
+            if pitch is None and gpitch_deg is not None: pitch=gpitch_deg
             roll=_to_float(osf.get('roll'))
             if roll is None: roll=_to_float(mp.get('roll'))
 
@@ -344,7 +356,7 @@ def main():
             emo=(of3.get('emotion') or of3.get('emotion_top1') or of3.get('emotion_label'))
             emo_conf=_to_float(of3.get('emotion_conf') or of3.get('emotion_prob') or of3.get('emotion_confidence'))
             if emo:
-                lbl=str(emo).strip().upper();
+                lbl=str(emo).strip().upper()
                 if lbl=='SURPRISE': lbl='SUPRISE'
                 if emo_conf is None or emo_conf>=0.60:
                     if lbl in sections['EMOTION']['counts']:
@@ -376,8 +388,8 @@ def main():
                 'src':{'of3':of3,'mp':mp,'osf':osf,'af':af,'mf':mfq,'fx':fx}
             }
             try:
-                outm.write(json.dumps(rec,ensure_ascii=False)+'
-')
+                outm.write(json.dumps(rec,ensure_ascii=False)+"
+")
             except Exception:
                 fails+=1
 
@@ -385,7 +397,6 @@ def main():
             eta=int((total-processed)/max(1,fps)); eta_s=f"{eta//60:02d}:{eta%60:02d}"
             tbl=render_bin_table('TAG', {'processed':processed,'total':total,'fails':fails}, sections,
                                  dupe_totals=None, dedupe_on=True, fps=fps, eta=eta_s)
-            from bin_table import write_bin_table
             write_bin_table(logs, tbl)
             bar.update(processed, fails=fails, fps=fps)
 

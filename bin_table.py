@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Unified ASCII bin-table renderer shared by tag.py and match.py.
-- Exact display section names/labels match your samples (bin_table.txt / bin_table_match.txt).
+- Exact display names/labels match your samples (bin_table.txt / bin_table_match.txt).
 - 16-char progress bars; fixed separators; single-space field gaps.
 - MATCH view supports DUPE totals and per-row dupes; hidden when dedupe is off.
 """
@@ -90,17 +90,19 @@ def render_bin_table(
     fails     = int(totals.get("fails", 0))
 
     buf = io.StringIO()
-    buf.write(_sep("=") + '
-')
-    buf.write(_sep("=") + '
-')
+    buf.write(_sep("=") + "
+")
+    buf.write(_sep("=") + "
+")
     buf.write(_hdr_line(mode, processed, max(1, total), fails,
                         dupe_totals if mode == "MATCH" else None,
                         fps, eta, title=mode) + "
-    buf.write(_sep("=") + '
-')
-    buf.write(_sep("=") + '
-')
+")
+    buf.write(_sep("=") + "
+")
+    buf.write(_sep("=") + "
+")
+
     for sec in SECTION_ORDER:
         data = sections.get(sec, {}) or {}
         counts: Dict[str, int] = {k.upper(): int(v) for k, v in (data.get("counts", {}) or {}).items()}
@@ -109,15 +111,21 @@ def render_bin_table(
         buf.write(_section_hdr_line(sec, max(1, total), counts, fails=0,
                                     mode=mode, dupe_totals=dupe_totals,
                                     dedupe_on=dedupe_on) + "
+")
         buf.write(_sep("-") + "
+")
+
         for label, cnt in counts.items():
             dupe_row = dupes_map.get(label) if (mode == "MATCH" and dedupe_on) else None
             buf.write(_row_line(label, max(1, total), int(cnt), mode=mode,
                                 dedupe_on=dedupe_on, dupe_row=dupe_row) + "
-        buf.write(_sep("=") + '
-')
-        buf.write(_sep("=") + '
-')
+")
+
+        buf.write(_sep("=") + "
+")
+        buf.write(_sep("=") + "
+")
+
     return buf.getvalue()
 
 

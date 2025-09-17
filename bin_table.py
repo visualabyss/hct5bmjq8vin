@@ -90,19 +90,17 @@ def render_bin_table(
     fails     = int(totals.get("fails", 0))
 
     buf = io.StringIO()
-    buf.write(_sep("=") + "
-")
-    buf.write(_sep("=") + "
-")
+    buf.write(_sep("=") + '
+')
+    buf.write(_sep("=") + '
+')
     buf.write(_hdr_line(mode, processed, max(1, total), fails,
                         dupe_totals if mode == "MATCH" else None,
                         fps, eta, title=mode) + "
-")
-    buf.write(_sep("=") + "
-")
-    buf.write(_sep("=") + "
-")
-
+    buf.write(_sep("=") + '
+')
+    buf.write(_sep("=") + '
+')
     for sec in SECTION_ORDER:
         data = sections.get(sec, {}) or {}
         counts: Dict[str, int] = {k.upper(): int(v) for k, v in (data.get("counts", {}) or {}).items()}
@@ -111,21 +109,15 @@ def render_bin_table(
         buf.write(_section_hdr_line(sec, max(1, total), counts, fails=0,
                                     mode=mode, dupe_totals=dupe_totals,
                                     dedupe_on=dedupe_on) + "
-")
         buf.write(_sep("-") + "
-")
-
         for label, cnt in counts.items():
             dupe_row = dupes_map.get(label) if (mode == "MATCH" and dedupe_on) else None
             buf.write(_row_line(label, max(1, total), int(cnt), mode=mode,
                                 dedupe_on=dedupe_on, dupe_row=dupe_row) + "
-")
-
-        buf.write(_sep("=") + "
-")
-        buf.write(_sep("=") + "
-")
-
+        buf.write(_sep("=") + '
+')
+        buf.write(_sep("=") + '
+')
     return buf.getvalue()
 
 

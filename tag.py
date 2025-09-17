@@ -67,7 +67,7 @@ def _read_csv_map(path:Path, key_cols=("file","path","name")):
 def _to_float(x)->Optional[float]:
     try:
         if x is None: return None
-        s=str(x).strip();
+        s=str(x).strip()
         if s=="": return None
         return float(s)
     except Exception:
@@ -387,11 +387,7 @@ def main():
                 'pose':{'yaw':yaw,'pitch':pitch,'roll':roll}, 'gaze_deg':{'yaw':gyaw_deg,'pitch':gpitch_deg},
                 'src':{'of3':of3,'mp':mp,'osf':osf,'af':af,'mf':mfq,'fx':fx}
             }
-            try:
-                outm.write(json.dumps(rec, ensure_ascii=False) + '
-')
-            except Exception:
-                fails+=1
+            outm.write(json.dumps(rec,ensure_ascii=False)+"\n")
 
             elapsed=time.time()-t0; fps=int(processed/elapsed) if elapsed>0 else 0
             eta=int((total-processed)/max(1,fps)); eta_s=f"{eta//60:02d}:{eta%60:02d}"

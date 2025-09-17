@@ -5,25 +5,6 @@ Unified ASCII bin-table renderer shared by tag.py and match.py.
 - Exact display section names/labels match your samples (bin_table.txt / bin_table_match.txt).
 - 16-char progress bars; fixed separators; single-space field gaps.
 - MATCH view supports DUPE totals and per-row dupes; hidden when dedupe is off.
-
-API (import and call):
-
-from bin_table import render_bin_table, write_bin_table
-
-text = render_bin_table(
-    mode="TAG",                                  # or "MATCH"
-    totals={"processed": N, "total": M, "fails": F},
-    sections={                                     # order matters; use keys below
-        "GAZE":      {"counts": {"FRONT": a, "LEFT": b}},
-        # ... other sections ...
-    },
-    dupe_totals=K,                                 # only used when mode=="MATCH"
-    dedupe_on=True,                                # if False, hide DUPE fields entirely
-    fps=FPS_or_None,
-    eta="MM:SS" or None,
-)
-
-write_bin_table(log_dir, text)  # atomic when possible; safe fallback if file is open in another app
 """
 from __future__ import annotations
 from pathlib import Path
@@ -33,13 +14,13 @@ import io, os
 BAR_WIDTH = 16
 SEP_LEN   = 112
 
-# Canonical display order and child labels (exact spelling/case)
+# Canonical display order (exact spelling)
 SECTION_ORDER = [
     "GAZE","EYES","MOUTH","SMILE","EMOTION","YAW","PITCH",
     "IDENTITY","QUALITY","TEMP","EXPOSURE",
 ]
 
-# Helpers
+# ---- helpers -----------------------------------------------------------
 
 def _bar(pct: float) -> str:
     pct = 0.0 if pct != pct else max(0.0, min(100.0, pct))  # clamp; NaN->0
@@ -91,6 +72,8 @@ def _row_line(label: str, total: int, count: int,
         return f"{label:<12}|{bar}| {pct:6.1f}% {count}"
 
 
+# ---- renderer ---------------------------------------------------------
+
 def render_bin_table(
     mode: str,
     totals: Dict[str, Any],
@@ -100,26 +83,25 @@ def render_bin_table(
     fps: Optional[int] = None,
     eta: Optional[str] = None,
 ) -> str:
-    """Return full table text for bin_table.txt.
-    - mode: "TAG" or "MATCH"
-    - totals: {processed,total,fails}
-    - sections: {SECTION: {"counts": {LABEL: n, ...}, "dupes": {LABEL: k, ...}?}}
-    - dupe_totals: total dupes (only used for MATCH header/section headers)
-    - dedupe_on: hide DUPE fields entirely when False
-    """
+    """Return full table text for bin_table.txt."""
     mode = (mode or "TAG").upper()
     processed = int(totals.get("processed", 0))
     total     = int(totals.get("total", 0))
     fails     = int(totals.get("fails", 0))
 
     buf = io.StringIO()
-    buf.write(_sep("=") + "\n")
-    buf.write(_sep("=") + "\n")
+    buf.write(_sep("=") + "
+")
+    buf.write(_sep("=") + "
+")
     buf.write(_hdr_line(mode, processed, max(1, total), fails,
                         dupe_totals if mode == "MATCH" else None,
-                        fps, eta, title=mode) + "\n")
-    buf.write(_sep("=") + "\n")
-    buf.write(_sep("=") + "\n")
+                        fps, eta, title=mode) + "
+")
+    buf.write(_sep("=") + "
+")
+    buf.write(_sep("=") + "
+")
 
     for sec in SECTION_ORDER:
         data = sections.get(sec, {}) or {}
@@ -128,26 +110,29 @@ def render_bin_table(
 
         buf.write(_section_hdr_line(sec, max(1, total), counts, fails=0,
                                     mode=mode, dupe_totals=dupe_totals,
-                                    dedupe_on=dedupe_on) + "\n")
-        buf.write(_sep("-") + "\n")
+                                    dedupe_on=dedupe_on) + "
+")
+        buf.write(_sep("-") + "
+")
 
         for label, cnt in counts.items():
             dupe_row = dupes_map.get(label) if (mode == "MATCH" and dedupe_on) else None
             buf.write(_row_line(label, max(1, total), int(cnt), mode=mode,
-                                dedupe_on=dedupe_on, dupe_row=dupe_row) + "\n")
+                                dedupe_on=dedupe_on, dupe_row=dupe_row) + "
+")
 
-        buf.write(_sep("=") + "\n")
-        buf.write(_sep("=") + "\n")
+        buf.write(_sep("=") + "
+")
+        buf.write(_sep("=") + "
+")
 
     return buf.getvalue()
 
 
+# ---- writer -----------------------------------------------------------
+
 def write_bin_table(log_dir: Path | str, text: str) -> None:
-    """Write bin_table.txt atomically when possible.
-    When the destination is held open by another program (e.g., Notepad on Windows host
-    via a bind mount), rename can fail with PermissionError. In that case, fall back to
-    direct overwrite to keep live-updating behavior.
-    """
+    """Write bin_table.txt atomically when possible; fall back if destination is locked."""
     out = Path(log_dir) / "bin_table.txt"
     tmp = out.with_suffix('.tmp')
     try:
@@ -169,12 +154,13 @@ def write_bin_table(log_dir: Path | str, text: str) -> None:
         except Exception:
             pass
 
-# Optional: write a tiny help file once
+# Tiny help file once
 try:
     help_path = Path(__file__).with_suffix('.txt')
     if not help_path.exists():
         help_path.write_text(
-            "Shared bin-table renderer. Sections: GAZE, EYES, MOUTH, SMILE, EMOTION, YAW, PITCH, IDENTITY, QUALITY, TEMP, EXPOSURE.\n",
+            "Shared bin-table renderer. Sections: GAZE, EYES, MOUTH, SMILE, EMOTION, YAW, PITCH, IDENTITY, QUALITY, TEMP, EXPOSURE.
+",
             encoding='utf-8')
 except Exception:
     pass

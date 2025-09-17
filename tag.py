@@ -388,8 +388,8 @@ def main():
                 'src':{'of3':of3,'mp':mp,'osf':osf,'af':af,'mf':mfq,'fx':fx}
             }
             try:
-                outm.write(json.dumps(rec,ensure_ascii=False)+"
-")
+                outm.write(json.dumps(rec, ensure_ascii=False) + '
+')
             except Exception:
                 fails+=1
 

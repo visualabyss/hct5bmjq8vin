@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 TAG (Step 3): fusion → real bins + live counts + bin_score.
-- Keeps live bin_table + manifest streaming and auto-help.
-- Adds: pose/eyes/mouth/smile/teeth/gaze fusion, quality/identity bins, temp/exposure (face-only),
+- Live bin_table + manifest streaming and auto-help.
+- Pose/eyes/mouth/smile/teeth/gaze fusion, quality/identity bins, temp/exposure (face-only),
   human-friendly display names (exactly as in your raw tables), and per-image bin_score.
 """
 from __future__ import annotations
@@ -119,7 +119,7 @@ def _ellipse_face_mask(H:int, W:int, shrink:float=0.86) -> np.ndarray:
 
 def _estimate_temp_exposure(im_bgr: np.ndarray) -> Tuple[Optional[float], str, str]:
     H,W = im_bgr.shape[:2]
-    mask = _ellipse_face_mask(H,W,0.86)  # MP/OSF mask fallback; ellipse for speed
+    mask = _ellipse_face_mask(H,W,0.86)  # fallback ROI; fast & background-safe
     m = (mask>0)
     if not np.any(m):
         return None, "NEUTRAL", "NORMAL"
@@ -146,13 +146,6 @@ def _estimate_temp_exposure(im_bgr: np.ndarray) -> Tuple[Optional[float], str, s
 
 # ------------------------------ fusion utils ------------------------------
 
-def _fuse_pose(osf: Dict[str,str]) -> Tuple[Optional[float],Optional[float],Optional[float]]:
-    yaw = _to_float(osf.get('yaw'))
-    pitch = _to_float(osf.get('pitch'))
-    roll = _to_float(osf.get('roll'))
-    return yaw, pitch, roll
-
-
 def _fuse_gaze(of3: Dict[str,str]) -> Tuple[Optional[float],Optional[float]]:
     gy = _to_float(of3.get('pose_yaw'))
     gp = _to_float(of3.get('pose_pitch'))
@@ -162,18 +155,15 @@ def _fuse_gaze(of3: Dict[str,str]) -> Tuple[Optional[float],Optional[float]]:
 
 
 def _eyes_state(mp: Dict[str,str], osf: Dict[str,str]) -> str:
-    # MP continuous openness
     ebl = _to_float(mp.get('eyeBlinkLeft'))
     ebr = _to_float(mp.get('eyeBlinkRight'))
     open_l = 1.0 - ebl if ebl is not None else None
     open_r = 1.0 - ebr if ebr is not None else None
-    # OSF blink override
     bl = _to_float(osf.get('blink_l')); br = _to_float(osf.get('blink_r'))
     if bl is not None and bl>0.60: open_l = min(open_l or 0.0, 0.1)
     if br is not None and br>0.60: open_r = min(open_r or 0.0, 0.1)
-    # decide
     if open_l is None or open_r is None:
-        return "OPEN"  # fallback optimistic
+        return "OPEN"
     diff = open_l - open_r
     avg  = 0.5*(open_l+open_r)
     if abs(diff) >= 0.5 and avg >= 0.3:
@@ -193,17 +183,13 @@ def _mouth_bins(of3: Dict[str,str], mp: Dict[str,str], au_thr: Dict[str,float]) 
     smile_r = _to_float(mp.get('mouthSmileRight'))
     mouth_open = max([v for v in [au25,au26,jaw,mopen] if v is not None] or [0.0])
     smile_score = max([v for v in [au12,smile_l,smile_r] if v is not None] or [0.0])
-    # bins
     if mouth_open >= max(0.60, au_thr.get('25',0.5)*0.9): m_bin = "OPEN"
     elif mouth_open >= max(0.30, au_thr.get('25',0.5)*0.6): m_bin = "SLIGHT"
     else: m_bin = "CLOSE"
-
     if mouth_open >= max(0.55, au_thr.get('25',0.5)*0.9) and smile_score >= max(0.50, au_thr.get('12',0.5)*0.9):
-        s_bin = "TEETH"
-        teeth = True
+        s_bin = "TEETH"; teeth = True
     elif smile_score >= max(0.50, au_thr.get('12',0.5)*0.9):
-        s_bin = "CLOSED"
-        teeth = False
+        s_bin = "CLOSED"; teeth = False
     else:
         s_bin = "NONE"; teeth=False
     return m_bin, s_bin, teeth, float(mouth_open), float(smile_score)
@@ -336,7 +322,6 @@ def main():
     src_maps['fx'] = _read_csv_map(vs)
 
     # ---------------- per-clip calibrations ----------------
-    # ID threshold (robust fallback)
     def _calib_id_threshold(af_map: Dict[str,Dict[str,str]]) -> float:
         vals = [ _to_float(v.get('id_score')) for v in af_map.values() ]
         vals = [x for x in vals if x is not None]
@@ -347,7 +332,6 @@ def main():
 
     id_thresh = _calib_id_threshold(src_maps.get('af', {})) if use_af else 0.55
 
-    # MagFace tertiles
     def _calib_mag_tertiles(mf_map: Dict[str,Dict[str,str]]) -> Tuple[float,float]:
         mags=[]
         for v in mf_map.values():
@@ -360,7 +344,6 @@ def main():
 
     q_lo,q_hi = _calib_mag_tertiles(src_maps.get('mf', {})) if use_mf else (0.0,0.0)
 
-    # AU thresholds (80th percentile per-AU over clip)
     def _calib_au_thresholds(of3_map: Dict[str,Dict[str,str]]) -> Dict[str,float]:
         vals={k:[] for k in AU_KEYS}
         for row in of3_map.values():
@@ -398,7 +381,6 @@ def main():
         try: manifest_path.unlink()
         except: pass
 
-    # init live bin table counts
     def init_sections_counts():
         return {
             "GAZE":     {"counts":{k:0 for k in GAZE_LABELS}},
@@ -424,7 +406,7 @@ def main():
     t0=time.time()
 
     # process sequentially; write manifest with bins & scores
-    with manifest_path.open("a", encoding="utf-8") as mf:
+    with open(manifest_path, 'a', encoding='utf-8') as out_manifest:
         for p in imgs:
             processed += 1
             fn = p.name
@@ -435,15 +417,12 @@ def main():
             mfq = src_maps.get('mf',{}).get(fn)  or {}
             fx  = src_maps.get('fx',{}).get(fn)  or {}
 
-            # derived: gaze (deg)
             gyaw_deg, gpitch_deg = _fuse_gaze(of3)
 
-            # pose: OSF primary
             yaw = _to_float(osf.get('yaw'))
             pitch = _to_float(osf.get('pitch'))
             roll = _to_float(osf.get('roll'))
 
-            # temp/exposure (face-only ellipse)
             tempK=None; temp_bin="NEUTRAL"; exp_bin="NORMAL"
             try:
                 im = cv2.imdecode(np.fromfile(str(p), dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -453,18 +432,13 @@ def main():
             except Exception:
                 pass
 
-            # eyes / mouth / smile
             eyes_bin = _eyes_state(mp, osf)
             m_bin, s_bin, teeth, mopen_val, smile_val = _mouth_bins(of3, mp, au_thr)
 
-            # gaze bin
             gaze_bin = _gaze_bin(gyaw_deg, gpitch_deg)
-
-            # yaw/pitch bins
             yaw_bin = _yaw_bin(yaw)
             pitch_bin = _pitch_bin(pitch)
 
-            # identity & quality
             id_score = _to_float(af.get('id_score'))
             id_bin = None
             if id_score is not None:
@@ -473,18 +447,17 @@ def main():
             mag = _to_float(mfq.get('quality') or mfq.get('mag'))
             q_bin = _quality_bin(mag, q_lo, q_hi) if use_mf else "MID"
 
-            # sections increments
             sections["GAZE"]["counts"][gaze_bin] += 1
             sections["EYES"]["counts"][eyes_bin] += 1
             sections["MOUTH"]["counts"][m_bin] += 1
             sections["SMILE"]["counts"][s_bin] += 1
-            # emotion (soft): map if present & confident, else skip increment
+
             emo_lbl=None
             emo = (of3.get('emotion') or of3.get('emotion_top1') or of3.get('emotion_label'))
             emo_conf = _to_float(of3.get('emotion_conf') or of3.get('emotion_prob') or of3.get('emotion_confidence'))
             if emo:
                 lbl = str(emo).strip().upper()
-                if lbl=="SURPRISE": lbl="SUPRISE"  # match table spelling
+                if lbl=="SURPRISE": lbl="SUPRISE"
                 if emo_conf is None or emo_conf>=0.60:
                     if lbl in sections["EMOTION"]["counts"]:
                         sections["EMOTION"]["counts"][lbl]+=1
@@ -495,7 +468,6 @@ def main():
             sections["TEMP"]["counts"][temp_bin]+=1
             sections["EXPOSURE"]["counts"][exp_bin]+=1
 
-            # pose centering score
             def _yaw_center(yb: str) -> float:
                 return {"FRONT":0.0, "LEFT":-25.0, "RIGHT":25.0,
                         "3/4 LEFT":-45.0, "3/4 RIGHT":45.0,
@@ -509,24 +481,19 @@ def main():
                 hw = _yaw_halfwidth(yaw_bin)
                 pose_center = max(0.0, 1.0 - abs(yaw - _yaw_center(yaw_bin))/max(1e-6, hw))
 
-            # expr bonus from smile
             expr_bonus = float(smile_val)
-            # pnp penalty
             pnp = _to_float(osf.get('pnp_error')) or 0.0
             pnp_norm = min(1.0, pnp/0.02)
 
-            # quality normalized approx
             if use_mf and mag is not None and q_hi>q_lo:
                 q_norm = float(np.clip((mag - q_lo) / max(1e-9, (q_hi - q_lo)), 0.0, 1.0))
             else:
                 q_norm = 0.5
 
-            # id score default
             id_s = float(id_score) if id_score is not None else 0.55
 
             bin_score = 0.55*id_s + 0.30*q_norm + 0.10*pose_center + 0.05*expr_bonus - 0.05*pnp_norm
 
-            # write manifest record
             rec = {
                 "file": fn,
                 "bins": {
@@ -555,9 +522,7 @@ def main():
                 "src": {"of3": of3, "mp": mp, "osf": osf, "af": af, "mf": mfq, "fx": fx}
             }
             try:
-                with open(manifest_path, 'a', encoding='utf-8') as out:
-                    out.write(json.dumps(rec, ensure_ascii=False) + '
-')
+                out_manifest.write(json.dumps(rec, ensure_ascii=False) + '\n')
             except Exception:
                 fails += 1
 

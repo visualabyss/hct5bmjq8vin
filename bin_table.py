@@ -3,7 +3,7 @@
 """
 Unified ASCII bin-table renderer shared by tag.py and match.py.
 - Exact display names/labels match your samples (bin_table.txt / bin_table_match.txt).
-- 16-char progress bars; fixed separators; single-space field gaps.
+- Progress bars; fixed separators; single-space field gaps.
 - MATCH view supports DUPE totals and per-row dupes; hidden when dedupe is off.
 """
 from __future__ import annotations
@@ -14,7 +14,6 @@ import io, os
 BAR_WIDTH = 16
 SEP_LEN   = 112
 
-# Canonical display order (exact spelling)
 SECTION_ORDER = [
     "GAZE","EYES","MOUTH","SMILE","EMOTION","YAW","PITCH",
     "IDENTITY","QUALITY","TEMP","EXPOSURE",
@@ -23,7 +22,10 @@ SECTION_ORDER = [
 # ---- helpers -----------------------------------------------------------
 
 def _bar(pct: float) -> str:
-    pct = 0.0 if pct != pct else max(0.0, min(100.0, pct))  # clamp; NaN->0
+    try:
+        pct = max(0.0, min(100.0, float(pct)))
+    except Exception:
+        pct = 0.0
     filled = int(round(BAR_WIDTH * pct / 100.0))
     return ("█" * filled) + (" " * (BAR_WIDTH - filled))
 
@@ -46,7 +48,7 @@ def _hdr_line(mode: str, processed: int, total: int, fails: int,
     if mode == "MATCH" and dupe_totals is not None:
         base += f" DUPE {dupe_totals}"
     if fps is not None and eta:
-        base += f" {int(fps)} FPS ETA {eta}"
+        base += f" {int(fps)} FPS   ETA {eta}"
     return base
 
 
@@ -83,24 +85,24 @@ def render_bin_table(
     fps: Optional[int] = None,
     eta: Optional[str] = None,
 ) -> str:
-    """Return full table text for bin_table.txt."""
     mode = (mode or "TAG").upper()
     processed = int(totals.get("processed", 0))
     total     = int(totals.get("total", 0))
     fails     = int(totals.get("fails", 0))
 
     buf = io.StringIO()
-    buf.write(_sep("=") + "
+    # header block
+    buf.write(_sep('=' ) + "
 ")
-    buf.write(_sep("=") + "
+    buf.write(_sep('=' ) + "
 ")
     buf.write(_hdr_line(mode, processed, max(1, total), fails,
                         dupe_totals if mode == "MATCH" else None,
                         fps, eta, title=mode) + "
 ")
-    buf.write(_sep("=") + "
+    buf.write(_sep('=' ) + "
 ")
-    buf.write(_sep("=") + "
+    buf.write(_sep('=' ) + "
 ")
 
     for sec in SECTION_ORDER:
@@ -108,22 +110,25 @@ def render_bin_table(
         counts: Dict[str, int] = {k.upper(): int(v) for k, v in (data.get("counts", {}) or {}).items()}
         dupes_map: Dict[str, int] = {k.upper(): int(v) for k, v in (data.get("dupes", {}) or {}).items()}
 
+        # section header
         buf.write(_section_hdr_line(sec, max(1, total), counts, fails=0,
                                     mode=mode, dupe_totals=dupe_totals,
                                     dedupe_on=dedupe_on) + "
 ")
-        buf.write(_sep("-") + "
+        buf.write(_sep('-') + "
 ")
 
+        # rows
         for label, cnt in counts.items():
             dupe_row = dupes_map.get(label) if (mode == "MATCH" and dedupe_on) else None
             buf.write(_row_line(label, max(1, total), int(cnt), mode=mode,
                                 dedupe_on=dedupe_on, dupe_row=dupe_row) + "
 ")
 
-        buf.write(_sep("=") + "
+        # section trailer
+        buf.write(_sep('=') + "
 ")
-        buf.write(_sep("=") + "
+        buf.write(_sep('=') + "
 ")
 
     return buf.getvalue()

@@ -133,7 +133,7 @@ def _estimate_temp_exposure(bgr: np.ndarray):
     sdr = bgr.astype(np.float64)/255.0
     low = float(((sdr[...,0][m] < 0.02).mean() + (sdr[...,1][m] < 0.02).mean() + (sdr[...,2][m] < 0.02).mean())*100/3)
     hi  = float(((sdr[...,0][m] > 0.98).mean() + (sdr[...,1][m] > 0.98).mean() + (sdr[...,2][m] > 0.98).mean())*100/3)
-    exp_bin = "OVER" if (hi > 0.5 and log_avg > 0.55) else ("UNDER" if (low > 3.0 and log_avg < 0.13) else "NORMAL")
+    exp_bin = "OVER" if (hi > 0.2 and log_avg > 0.52) else ("UNDER" if (low > 8.0 and log_avg < 0.09) else "NORMAL")
     return cct, temp_bin, exp_bin
 
 # ---------------- fusion ----------------
@@ -151,10 +151,10 @@ def _eyes_state(mp: Dict[str,str], osf: Dict[str,str]) -> str:
         return "OPEN"
     diff = open_l - open_r
     avg  = 0.5*(open_l + open_r)
-    if abs(diff) >= 0.35 and avg >= 0.45:
+    if abs(diff) >= 0.50 and avg >= 0.30:
         return "W-LEFT" if diff < 0 else "W-RIGHT"
-    if avg >= 0.55: return "OPEN"
-    if avg >= 0.35: return "HALF"
+    if avg >= 0.45: return "OPEN"
+    if avg >= 0.25: return "HALF"
     return "CLOSED"
 
 
@@ -317,7 +317,7 @@ def main():
         gy = gp = None
         if has_h:
             x = 0.5*((L_out - L_in) + (R_in - R_out))
-            gy = float(x)*30.0
+            gy = -float(x)*30.0  # flip sign to match ARKit/MP horizontal look convention
         if has_v:
             y = 0.5*((L_up - L_dn) + (R_up - R_dn))
             gp = float(y)*20.0
@@ -337,7 +337,7 @@ def main():
     # OF3 pose values are in radians; interpret and flip yaw sign to match MP
     med_of3_yaw   = (statistics.median(of3_y)*180.0/math.pi if of3_y else 0.0)
     med_of3_pitch = (statistics.median(of3_p)*180.0/math.pi if of3_p else 0.0)
-    OF3_YAW_SIGN = -1.0
+    OF3_YAW_SIGN = 1.0
 
     # calibrations
     def _calib_id(af_map):
@@ -435,12 +435,12 @@ def main():
                 if gpitch_deg is not None: gpitch_deg -= med_of3_pitch
 
             # pose preference for YAW/PITCH bins: MP -> OSF -> OF3-derived, then median-center
-            yaw   = _to_float(mp.get('yaw'))
-            pitch = _to_float(mp.get('pitch'))
-            if yaw is None:   yaw   = _to_float(osf.get('yaw'))
-            if pitch is None: pitch = _to_float(osf.get('pitch'))
-            if yaw is None and gyaw_deg is not None: yaw = gyaw_deg
+            yaw   = _to_float(osf.get('yaw'))
+            pitch = _to_float(osf.get('pitch'))
+            if yaw is None and gyaw_deg is not None:   yaw = gyaw_deg
             if pitch is None and gpitch_deg is not None: pitch = gpitch_deg
+            if yaw is None:   yaw = _to_float(mp.get('yaw'))
+            if pitch is None: pitch = _to_float(mp.get('pitch'))
             roll = _to_float(mp.get('roll')) if _to_float(mp.get('roll')) is not None else _to_float(osf.get('roll'))
 
             if yaw is not None:   yaw   = float(yaw)   - med_yaw
@@ -481,7 +481,7 @@ def main():
             if emo:
                 lbl = str(emo).strip().upper()
                 if lbl == 'SURPRISE': lbl = 'SUPRISE'
-                if emo_conf is None or emo_conf >= 0.35:
+                if True:
                     if lbl in sections['EMOTION']['counts']:
                         sections['EMOTION']['counts'][lbl] += 1
                         emo_lbl = lbl

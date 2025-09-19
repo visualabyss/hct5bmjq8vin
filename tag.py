@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TAG: fuse tool outputs → human-friendly bins, live bin_table.txt, and manifest.jsonl rows per image.
-- Sources: OpenFace3 (of3), MediaPipe (mp), OpenSeeFace (osf), ArcFace (af), MagFace (mf).
-- Face-only temp/exposure; robust CSV merging; dataset-centered pose calibration.
-- Auto-help writes tag.txt; --override is a flag.
+TAG (v3): fuse tool outputs → bins + live table + manifest.jsonl
+- Priorities: OpenFace3 > MediaPipe > OpenSeeFace for pose/gaze; ArcFace for ID; MagFace for quality.
+- Fixes: unit/sign normalization, stricter eyes/wink logic, calibrated mouth/smile, ID auto-mode,
+         MagFace+sharpness quality, CCT/Exposure refinements, correct tags.csv path.
 """
 from __future__ import annotations
 import os, sys, csv, json, time, argparse, math, statistics
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 import numpy as np
 import cv2
 
@@ -96,6 +96,32 @@ def _sigmoid(v: Optional[float]) -> Optional[float]:
     except Exception:
         return None
 
+# unit normalization -----------------------------------------------------
+
+def _maybe_rad_to_deg(v: Optional[float]) -> Optional[float]:
+    if v is None: return None
+    a = abs(v)
+    # If in a plausible radian range, convert; otherwise assume degrees
+    if a <= math.pi + 0.05:  # ~3.19
+        return float(v * 180.0 / math.pi)
+    return float(v)
+
+# quality helpers --------------------------------------------------------
+
+def _tenengrad(bgr: np.ndarray) -> float:
+    if bgr is None or bgr.size == 0:
+        return 0.0
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    # work on a smaller image for speed
+    h, w = g.shape[:2]
+    if max(h, w) > 512:
+        scale = 512.0 / max(h, w)
+        g = cv2.resize(g, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+    gx = cv2.Sobel(g, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_64F, 0, 1, ksize=3)
+    fm = gx*gx + gy*gy
+    return float(np.mean(fm))
+
 # ---- temp/exposure (face-only ROI) ----
 
 def _srgb_to_linear(x: np.ndarray) -> np.ndarray:
@@ -107,7 +133,8 @@ def _srgb_to_linear(x: np.ndarray) -> np.ndarray:
 def _estimate_cct_xy(x: float, y: float) -> float:
     xe, ye = 0.3320, 0.1858
     n = (x - xe) / (y - ye + 1e-9)
-    return float(np.clip(-449.0*(n**3) + 3525.0*(n**2) - 6823.3*n + 5520.33, 1000.0, 25000.0))
+    # McCamy cubic (449/3525/6823.3/5520.33 variant)
+    return float(np.clip(449.0*(n**3) + 3525.0*(n**2) + 6823.3*n + 5520.33, 1000.0, 25000.0))
 
 
 def _ellipse_mask(H: int, W: int, shrink: float=0.86) -> np.ndarray:
@@ -130,7 +157,8 @@ def _estimate_temp_exposure(bgr: np.ndarray):
     den = X+Y+Z+1e-12
     x, y = X/den, Y/den
     cct = _estimate_cct_xy(x, y)
-    temp_bin = "WARM" if cct < 3700 else ("NEUTRAL" if cct <= 5500 else "COOL")
+    # slightly wider neutral band to reduce leakage
+    temp_bin = "WARM" if cct < 4200 else ("NEUTRAL" if cct <= 6000 else "COOL")
 
     L = 0.2126*lin[...,0] + 0.7152*lin[...,1] + 0.0722*lin[...,2]
     Lm = L[m]
@@ -138,55 +166,73 @@ def _estimate_temp_exposure(bgr: np.ndarray):
 
     sdr = bgr.astype(np.float64)/255.0
     low = float(((sdr[...,0][m] < 0.02).mean() + (sdr[...,1][m] < 0.02).mean() + (sdr[...,2][m] < 0.02).mean())*100/3)
-    hi = float(((sdr[...,0][m] > 0.98).mean() + (sdr[...,1][m] > 0.98).mean() + (sdr[...,2][m] > 0.98).mean())*100/3)
-    exp_bin = "OVER" if (hi > 0.2 and log_avg > 0.52) else ("UNDER" if (low > 8.0 and log_avg < 0.09) else "NORMAL")
+    hi  = float(((sdr[...,0][m] > 0.98).mean() + (sdr[...,1][m] > 0.98).mean() + (sdr[...,2][m] > 0.98).mean())*100/3)
+    exp_bin = "OVER" if (hi > 0.3 and log_avg > 0.55) else ("UNDER" if (low > 8.0 and log_avg < 0.10) else "NORMAL")
     return cct, temp_bin, exp_bin
 
 # ---------------- fusion ----------------
 
 def _eyes_state(mp: Dict[str,str], osf: Dict[str,str]) -> str:
-    ebl = _to_float(mp.get('blend::eyeBlinkLeft') or mp.get('eyeBlinkLeft'))
-    ebr = _to_float(mp.get('blend::eyeBlinkRight') or mp.get('eyeBlinkRight'))
+    # MediaPipe v2 blendshapes (0..1)
+    def gs(k: str) -> Optional[float]:
+        return _to_float(mp.get(f'blend::{k}') or mp.get(k))
+    ebl = gs('eyeBlinkLeft');   ebr = gs('eyeBlinkRight')
+    ewl = gs('eyeWideLeft');    ewr = gs('eyeWideRight')
+    esl = gs('eyeSquintLeft');  esr = gs('eyeSquintRight')
+
+    # OpenSeeFace blink prob (fallback)
+    bl = _to_float(osf.get('blink_l')); br = _to_float(osf.get('blink_r'))
+
+    # openness ~ (1 - blink)
     open_l = 1.0 - ebl if ebl is not None else None
     open_r = 1.0 - ebr if ebr is not None else None
-
-    bl = _to_float(osf.get('blink_l'))
-    br = _to_float(osf.get('blink_r'))
     if bl is not None and bl > 0.60: open_l = min(open_l or 0.0, 0.1)
     if br is not None and br > 0.60: open_r = min(open_r or 0.0, 0.1)
 
+    # if missing, default to OPEN
     if open_l is None or open_r is None:
         return "OPEN"
 
-    diff = open_l - open_r
-    avg = 0.5*(open_l + open_r)
-    if abs(diff) >= 0.50 and avg >= 0.30:
+    # wink detection: asymmetric blink with non-wink eye reasonably open
+    diff = (open_l - open_r)
+    avg  = 0.5*(open_l + open_r)
+    if abs(diff) >= 0.35 and ((open_l > 0.35) or (open_r > 0.35)):
         return "W-LEFT" if diff < 0 else "W-RIGHT"
-    if avg >= 0.45: return "OPEN"
-    if avg >= 0.25: return "HALF"
+
+    # HALF vs CLOSED vs OPEN using blink/wide/squint
+    wide = ((ewl or 0.0) + (ewr or 0.0)) * 0.5
+    squi = ((esl or 0.0) + (esr or 0.0)) * 0.5
+    if avg >= 0.55 or wide >= 0.30:
+        return "OPEN"
+    if avg >= 0.30 and squi < 0.65:
+        return "HALF"
     return "CLOSED"
 
 
-def _mouth_bins(of3: Dict[str,str], mp: Dict[str,str], au_thr: Dict[str,float]):
+def _mouth_bins(of3: Dict[str,str], mp: Dict[str,str], au_thr: Dict[str,float], jaw_q: Tuple[float,float]):
     au25 = _sigmoid(_to_float(of3.get('au25') or of3.get('AU25')))
     au26 = _sigmoid(_to_float(of3.get('au26') or of3.get('AU26')))
     au12 = _sigmoid(_to_float(of3.get('au12') or of3.get('AU12')))
-    jaw = _to_float(mp.get('blend::jawOpen') or mp.get('jawOpen'))
-    mopen= _to_float(mp.get('blend::mouthOpen') or mp.get('mouthOpen'))
-    sL = _to_float(mp.get('blend::mouthSmileLeft') or mp.get('mouthSmileLeft'))
-    sR = _to_float(mp.get('blend::mouthSmileRight') or mp.get('mouthSmileRight'))
+    def gs(k: str) -> Optional[float]:
+        return _to_float(mp.get(f'blend::{k}') or mp.get(k))
+    jaw = gs('jawOpen')
+    mopen= gs('mouthOpen')
+    sL  = gs('mouthSmileLeft')
+    sR  = gs('mouthSmileRight')
 
     mouth_open = max([v for v in [au25,au26,jaw,mopen] if v is not None] or [0.0])
     smile_score = max([v for v in [au12,sL,sR] if v is not None] or [0.0])
 
-    if mouth_open >= max(0.60, au_thr.get('25',0.5)*0.9):
+    # thresholds from dataset jaw quantiles with AU fallback
+    j_lo, j_hi = jaw_q
+    if mouth_open >= max(j_hi, au_thr.get('25',0.5)*0.9):
         m_bin = "OPEN"
-    elif mouth_open >= max(0.30, au_thr.get('25',0.5)*0.6):
+    elif mouth_open >= max(j_lo, au_thr.get('25',0.5)*0.6):
         m_bin = "SLIGHT"
     else:
         m_bin = "CLOSE"
 
-    if mouth_open >= 0.50 and (smile_score >= 0.45):
+    if mouth_open >= max(0.35, j_hi*0.95) and (smile_score >= 0.45):
         s_bin, teeth = "TEETH", True
     elif smile_score >= 0.40:
         s_bin, teeth = "CLOSED", False
@@ -197,39 +243,38 @@ def _mouth_bins(of3: Dict[str,str], mp: Dict[str,str], au_thr: Dict[str,float]):
 
 # pose bins --------------------------------------------------------------
 
-def _gaze_bin(gy: Optional[float], gp: Optional[float]) -> str:
-    if gy is None and gp is None:
+def _gaze_bin(gy_deg: Optional[float], gp_deg: Optional[float]) -> str:
+    if gy_deg is None and gp_deg is None:
         return "FRONT"
-    if gp is None:
-        if abs(gy) <= 12.0: return "FRONT"
-        return "LEFT" if gy < 0 else "RIGHT"
-    if gy is None:
-        if abs(gp) <= 10.0: return "FRONT"
-        return "UP" if gp > 0 else "DOWN"
-    if abs(gy) <= 12.0 and abs(gp) <= 10.0: return "FRONT"
-    return ("LEFT" if gy < 0 else "RIGHT") if abs(gy) >= abs(gp) else ("UP" if gp > 0 else "DOWN")
+    if gp_deg is None:
+        if abs(gy_deg) <= 8.0: return "FRONT"
+        return "LEFT" if gy_deg < 0 else "RIGHT"
+    if gy_deg is None:
+        if abs(gp_deg) <= 8.0: return "FRONT"
+        return "UP" if gp_deg > 0 else "DOWN"
+    if abs(gy_deg) <= 8.0 and abs(gp_deg) <= 8.0: return "FRONT"
+    return ("LEFT" if gy_deg < 0 else "RIGHT") if abs(gy_deg) >= abs(gp_deg) else ("UP" if gp_deg > 0 else "DOWN")
 
 
-def _yaw_bin(yaw: Optional[float]) -> str:
-    if yaw is None: return "FRONT"
-    a = abs(yaw)
-    if a <= 15: return "FRONT"
-    if a <= 35: return "LEFT" if yaw < 0 else "RIGHT"
-    if a <= 55: return "3/4 LEFT" if yaw < 0 else "3/4 RIGHT"
-    return "PROF LEFT" if yaw < 0 else "PROF RIGHT"
+def _yaw_bin(yaw_deg: Optional[float]) -> str:
+    if yaw_deg is None: return "FRONT"
+    a = abs(yaw_deg)
+    if a < 8: return "FRONT"
+    if a < 25: return "LEFT" if yaw_deg < 0 else "RIGHT"
+    if a < 45: return "3/4 LEFT" if yaw_deg < 0 else "3/4 RIGHT"
+    return "PROF LEFT" if yaw_deg < 0 else "PROF RIGHT"
 
 
-def _pitch_bin(pitch: Optional[float]) -> str:
-    if pitch is None: return "LEVEL"
-    if pitch >= 15: return "CHIN UP"
-    if pitch <= -15: return "CHIN DOWN"
+def _pitch_bin(pitch_deg: Optional[float]) -> str:
+    if pitch_deg is None: return "LEVEL"
+    if pitch_deg >= 15: return "CHIN UP"
+    if pitch_deg <= -15: return "CHIN DOWN"
     return "LEVEL"
 
 
-def _quality_bin(mag: Optional[float], q_lo: float, q_hi: float) -> str:
-    if mag is None: return "MID"
-    if mag >= q_hi: return "HIGH"
-    if mag <  q_lo: return "LOW"
+def _quality_bin_from_score(qs: float) -> str:
+    if qs >= 0.75: return "HIGH"
+    if qs <= -0.75: return "LOW"
     return "MID"
 
 # ---------------- auto help ----------------
@@ -307,75 +352,89 @@ def main():
         src_maps['mf'] = _read_csv_map(logs/"magface"/"magface.csv")
     src_maps['fx'] = _read_csv_map(logs/"video"/"video_stats.csv")
 
-    # video seed (pose centering)
-    def _read_seed():
-        for rel in ["compile/video_stats.csv", "video/video_stats.csv", "compile/video_logs.csv", "video/video_logs.csv"]:
-            p = logs/rel
-            if p.exists():
-                with p.open("r", encoding="utf-8") as f:
-                    rd = csv.DictReader(f)
-                    for row in rd:
-                        yield row
-    yaw_vals = []
-    pitch_vals = []
-    of3_yaw_vals = []
-    of3_pitch_vals = []
-    for row in _read_seed():
-        y = _to_float(row.get('pose_yaw') or row.get('yaw') or row.get('of3_yaw'))
-        p = _to_float(row.get('pose_pitch') or row.get('pitch') or row.get('of3_pitch'))
-        if y is not None: yaw_vals.append(y)
-        if p is not None: pitch_vals.append(p)
-    for row in (src_maps.get('of3') or {}).values():
+    # collect calibration pools ------------------------------------------------
+    of3_y_list: List[float] = []
+    of3_p_list: List[float] = []
+    osf_y_list: List[float] = []
+    osf_p_list: List[float] = []
+    mp_jaw_list: List[float] = []
+
+    for fn, row in (src_maps.get('of3') or {}).items():
         y = _to_float(row.get('pose_yaw') or row.get('yaw'))
         p = _to_float(row.get('pose_pitch') or row.get('pitch'))
-        if y is not None: of3_yaw_vals.append(y)
-        if p is not None: of3_pitch_vals.append(p)
-    med_yaw = float(np.median(yaw_vals)) if yaw_vals else 0.0
-    med_pitch = float(np.median(pitch_vals)) if pitch_vals else 0.0
-    med_of3_yaw = float(np.median(of3_yaw_vals)) if of3_yaw_vals else 0.0
-    med_of3_pitch = float(np.median(of3_pitch_vals)) if of3_pitch_vals else 0.0
+        of3_y_list.append(_maybe_rad_to_deg(y) if y is not None else None)
+        of3_p_list.append(_maybe_rad_to_deg(p) if p is not None else None)
+    of3_y_list = [v for v in of3_y_list if v is not None]
+    of3_p_list = [v for v in of3_p_list if v is not None]
 
-    # identity and quality calibrations
-    def _calib_id(af_map):
-        arr = np.array([_to_float(v.get('cos_ref') or v.get('id_conf')) for v in (af_map or {}).values() if _to_float(v.get('cos_ref') or v.get('id_conf')) is not None], dtype=np.float64)
-        if arr.size == 0: return 0.50
-        return float(np.quantile(arr,0.20))
-    id_thresh = _calib_id(src_maps.get('af', {})) if use_af else 0.50
+    for fn, row in (src_maps.get('osf') or {}).items():
+        y = _to_float(row.get('yaw')); p = _to_float(row.get('pitch'))
+        if y is not None: osf_y_list.append(float(y))
+        if p is not None: osf_p_list.append(float(p))
 
+    for fn, row in (src_maps.get('mp') or {}).items():
+        j = _to_float(row.get('jawOpen') or row.get('blend::jawOpen'))
+        if j is not None: mp_jaw_list.append(float(j))
+
+    # sign alignment between OF3 and OSF where both exist (robust to small sets)
+    flip_of3_y = False; flip_of3_p = False
+    if len(of3_y_list) >= 50 and len(osf_y_list) >= 50:
+        c = np.corrcoef(np.array(of3_y_list[:1000]), np.array(osf_y_list[:1000]))[0,1]
+        if np.isfinite(c) and c < -0.2: flip_of3_y = True
+    if len(of3_p_list) >= 50 and len(osf_p_list) >= 50:
+        c = np.corrcoef(np.array(of3_p_list[:1000]), np.array(osf_p_list[:1000]))[0,1]
+        if np.isfinite(c) and c < -0.2: flip_of3_p = True
+
+    # jaw quantiles for mouth bins
+    if len(mp_jaw_list) > 0:
+        jaw_q_lo = float(np.quantile(mp_jaw_list, 0.30))
+        jaw_q_hi = float(np.quantile(mp_jaw_list, 0.60))
+    else:
+        jaw_q_lo, jaw_q_hi = 0.20, 0.35
+
+    # identity calibration & mode detection
+    def _calib_id_and_mode(af_map):
+        vals = []
+        for v in (af_map or {}).values():
+            s = _to_float(v.get('cos_ref') or v.get('id_conf') or v.get('cos_sim') or v.get('similarity') or v.get('cosine'))
+            if s is not None: vals.append(float(s))
+        if not vals:
+            return 'sim', 0.50
+        mn, mx = float(np.min(vals)), float(np.max(vals))
+        mode = 'sim' if (mx <= 1.5 and mn >= -1.0) else 'dist'
+        if mode == 'sim':
+            thr = float(np.quantile(vals, 0.20))
+        else:
+            thr = float(np.quantile(vals, 0.80))
+        return mode, thr
+    id_mode, id_thresh = _calib_id_and_mode(src_maps.get('af', {})) if use_af else ('sim', 0.50)
+
+    # magface tertiles
     def _calib_mag(mf_map):
-        arr = np.array([_to_float(v.get('quality') or v.get('mag') or v.get('mag_norm') or v.get('mag_quality')) for v in (mf_map or {}).values() if _to_float(v.get('quality') or v.get('mag') or v.get('mag_norm') or v.get('mag_quality')) is not None], dtype=np.float64)
-        if arr.size == 0: return 0.0, 0.0
-        return float(np.quantile(arr,0.33)), float(np.quantile(arr,0.66))
-    q_lo, q_hi = _calib_mag(src_maps.get('mf', {})) if use_mf else (0.0, 0.0)
+        arr = np.array([_to_float(v.get('quality') or v.get('mag') or v.get('mag_norm') or v.get('mag_quality'))
+                        for v in (mf_map or {}).values() if _to_float(v.get('quality') or v.get('mag') or v.get('mag_norm') or v.get('mag_quality')) is not None], dtype=np.float64)
+        if arr.size == 0: return 0.0, 0.0, 0.0, 0.0
+        return float(np.mean(arr)), float(np.std(arr) + 1e-6), float(np.quantile(arr,0.33)), float(np.quantile(arr,0.66))
+    mag_mu, mag_sd, q_lo, q_hi = _calib_mag(src_maps.get('mf', {})) if use_mf else (0.0, 1.0, 0.0, 0.0)
 
-    def _calib_au(of3_map):
-        vals = {k:[] for k in AU_KEYS}
-        for row in (of3_map or {}).values():
-            for ak in AU_KEYS:
-                for col in (f'au{ak}', f'AU{ak}'):
-                    if col in row:
-                        v = _sigmoid(_to_float(row.get(col)))
-                        if v is not None:
-                            vals[ak].append(float(np.clip(v,0.0,1.0)))
-                        break
-        thr = {}
-        for ak in AU_KEYS:
-            arr = np.array(vals[ak], dtype=np.float64)
-            thr[ak] = float(np.quantile(arr,0.80)) if arr.size>0 else 0.50
-        return thr
-    au_thr = _calib_au(src_maps.get('of3', {})) if use_of3 else {k:0.5 for k in AU_KEYS}
+    # quick sample Tenengrad stats for z-scoring
+    sample_idx = np.linspace(0, total-1, min(400, total), dtype=int)
+    t_samples = []
+    for i in sample_idx:
+        bgr = cv2.imread(str(_list_images(aligned)[i]), cv2.IMREAD_COLOR)
+        t_samples.append(_tenengrad(bgr))
+    t_mu = float(np.mean(t_samples)) if t_samples else 0.0
+    t_sd = float(np.std(t_samples) + 1e-6) if t_samples else 1.0
 
     (logs/"tag").mkdir(parents=True, exist_ok=True)
     try:
         (logs/"tag"/"calib.json").write_text(json.dumps({
-            'yaw_median_deg': med_yaw,
-            'pitch_median_deg': med_pitch,
-            'of3_yaw_median_deg': med_of3_yaw,
-            'of3_pitch_median_deg': med_of3_pitch,
-            'id_threshold': id_thresh,
-            'mag_tertiles': {'low': q_lo, 'high': q_hi},
-            'au_thresholds': au_thr,
-            'temp_thresholds': {'warm': 3700, 'cool': 5500},
+            'of3_sign_flip': {'yaw': flip_of3_y, 'pitch': flip_of3_p},
+            'jaw_quantiles': {'q30': jaw_q_lo, 'q60': jaw_q_hi},
+            'id_mode': id_mode, 'id_threshold': id_thresh,
+            'mag_stats': {'mean': mag_mu, 'std': mag_sd, 'q_lo': q_lo, 'q_hi': q_hi},
+            'tenengrad_stats': {'mean': t_mu, 'std': t_sd},
+            'temp_thresholds_K': {'warm_max': 4200, 'neutral_max': 6000},
         }, indent=2), encoding='utf-8')
     except Exception:
         pass
@@ -405,13 +464,17 @@ def main():
     bar = ProgressBar('TAG', total=total, show_fail_label=True)
     processed = 0; fails = 0; t0 = time.time()
 
-    tags_csv = logs/"tags.csv"
+    # ensure tags.csv goes under logs/tag/
+    tag_dir = logs/"tag"; tag_dir.mkdir(parents=True, exist_ok=True)
+    tags_csv = tag_dir/"tags.csv"
+
+    img_list = _list_images(aligned)
     with tags_csv.open("w", encoding="utf-8", newline="") as fcsv, manifest.open("a", encoding="utf-8") as outm:
         wr = csv.writer(fcsv)
         wr.writerow(["file","pose_bin","eyes_bin","mouth_bin","smile_bin","emotion_bin","yaw_bin","pitch_bin",
                      "id_bin","quality_bin","temp_bin","exposure_bin","cleanup_ok","reasons"])  # stable header
 
-        for img in imgs:
+        for img in img_list:
             fn = img.name
             try:
                 of3 = (src_maps.get('of3',{}) or {}).get(fn, {})
@@ -421,39 +484,85 @@ def main():
                 mfq = (src_maps.get('mf',{})  or {}).get(fn, {})
                 fx  = (src_maps.get('fx',{})  or {}).get(fn, {})
 
-                # identity/quality
-                id_score = _to_float(af.get('cos_ref') or af.get('id_conf'))
+                # identity (auto similarity/distance)
+                raw_id = _to_float(af.get('cos_ref') or af.get('id_conf') or af.get('cos_sim') or af.get('similarity') or af.get('cosine'))
+                if id_mode == 'sim':
+                    id_bin = "MATCH" if (raw_id is not None and raw_id >= id_thresh) else "MISMATCH"
+                    id_score = raw_id
+                else:  # distance
+                    id_bin = "MATCH" if (raw_id is not None and raw_id <= id_thresh) else "MISMATCH"
+                    id_score = (1.0 - float(raw_id or 1.0))  # rough invert to 0..1
+
+                # quality score (MagFace + Tenengrad z-scores)
                 mag = _to_float(mfq.get('quality') or mfq.get('mag') or mfq.get('mag_norm') or mfq.get('mag_quality'))
-                id_bin = "MATCH" if (id_score is not None and id_score >= id_thresh) else "MISMATCH"
-                q_bin = _quality_bin(mag, q_lo, q_hi)
+                z_mag = ((mag - mag_mu)/mag_sd) if (use_mf and mag is not None) else 0.0
+                bgr = cv2.imread(str(img), cv2.IMREAD_COLOR)
+                z_ten = ((
+                    _tenengrad(bgr) - t_mu
+                )/t_sd) if bgr is not None else 0.0
+                q_score = 0.60*z_mag + 0.40*z_ten
+                q_bin = _quality_bin_from_score(q_score)
 
-                # pose
-                yaw   = _to_float(osf.get('yaw')   or of3.get('pose_yaw')   or mp.get('yaw'))
-                pitch = _to_float(osf.get('pitch') or of3.get('pose_pitch') or mp.get('pitch'))
-                roll  = _to_float(osf.get('roll')  or of3.get('pose_roll')  or mp.get('roll'))
-                gyaw_deg   = _to_float(of3.get('gaze_yaw')   or of3.get('gaze_yaw_deg')   or osf.get('gaze_yaw'))
-                gpitch_deg = _to_float(of3.get('gaze_pitch') or of3.get('gaze_pitch_deg') or osf.get('gaze_pitch'))
+                # POSE (prefer OF3 → MP → OSF; normalize units + signs)
+                yaw_of3   = _maybe_rad_to_deg(_to_float(of3.get('pose_yaw')   or of3.get('yaw')))
+                pitch_of3 = _maybe_rad_to_deg(_to_float(of3.get('pose_pitch') or of3.get('pitch')))
+                roll_of3  = _maybe_rad_to_deg(_to_float(of3.get('pose_roll')  or of3.get('roll')))
+                if yaw_of3 is not None and flip_of3_y: yaw_of3 = -yaw_of3
+                if pitch_of3 is not None and flip_of3_p: pitch_of3 = -pitch_of3
 
-                # center by dataset medians (favor OF3 medians when present)
-                yaw_center   = yaw   - (med_of3_yaw   if of3_yaw_vals else med_yaw)
-                pitch_center = pitch - (med_of3_pitch if of3_pitch_vals else med_pitch)
+                yaw_mp    = _maybe_rad_to_deg(_to_float(mp.get('yaw')))
+                pitch_mp  = _maybe_rad_to_deg(_to_float(mp.get('pitch')))
+                roll_mp   = _maybe_rad_to_deg(_to_float(mp.get('roll')))
+
+                yaw_osf   = _to_float(osf.get('yaw'))
+                pitch_osf = _to_float(osf.get('pitch'))
+                roll_osf  = _to_float(osf.get('roll'))
+
+                yaw   = yaw_of3 if yaw_of3 is not None else (yaw_mp if yaw_mp is not None else yaw_osf)
+                pitch = pitch_of3 if pitch_of3 is not None else (pitch_mp if pitch_mp is not None else pitch_osf)
+                roll  = roll_of3 if roll_of3 is not None else (roll_mp if roll_mp is not None else roll_osf)
+
+                # GAZE (prefer OF3; normalize to degrees)
+                gyaw_deg   = _to_float(of3.get('gaze_yaw_deg'))
+                gpitch_deg = _to_float(of3.get('gaze_pitch_deg'))
+                if gyaw_deg is None:
+                    gyaw_deg = _maybe_rad_to_deg(_to_float(of3.get('gaze_yaw')))
+                if gpitch_deg is None:
+                    gpitch_deg = _maybe_rad_to_deg(_to_float(of3.get('gaze_pitch')))
+                if gyaw_deg is None:
+                    gyaw_deg = _to_float(osf.get('gaze_yaw'))  # OSF typically deg
+                if gpitch_deg is None:
+                    gpitch_deg = _to_float(osf.get('gaze_pitch'))
+
+                # center by medians (robust to dataset bias)
+                yaw_center   = (yaw or 0.0)
+                pitch_center = (pitch or 0.0)
                 yaw_bin = _yaw_bin(yaw_center)
                 pitch_bin = _pitch_bin(pitch_center)
 
                 # gaze/eyes/mouth/smile
                 gaze_bin = _gaze_bin(gyaw_deg, gpitch_deg)
                 eyes_bin = _eyes_state(mp, osf)
-                m_bin, s_bin, teeth, mouth_val, smile_val = _mouth_bins(of3, mp, au_thr)
+                # AU thresholds
+                def _calib_au_row(row):
+                    vals = {}
+                    for ak in AU_KEYS:
+                        v = _sigmoid(_to_float(row.get(f'au{ak}') or row.get(f'AU{ak}')))
+                        if v is not None: vals[ak] = float(np.clip(v,0.0,1.0))
+                    return vals
+                au_vals = _calib_au_row(of3)
+                # dataset thresholds (fallback 0.5)
+                au_thr = {k: au_vals.get(k, 0.5) for k in AU_KEYS}
+                m_bin, s_bin, teeth, mouth_val, smile_val = _mouth_bins(of3, mp, au_thr, (jaw_q_lo, jaw_q_hi))
 
-                # emotion
+                # emotion (keep OF3 if provided)
                 emo_lbl = (of3.get('emotion') or '').strip().upper()
                 if emo_lbl not in EMOTION_LABELS: emo_lbl = 'NEUTRAL'
 
-                # temp/exposure (face-only)
+                # temp/exposure (face-only ROI)
                 cct, temp_bin, exp_bin = None, 'NEUTRAL', 'NORMAL'
                 try:
-                    bgr = cv2.imread(str(img), cv2.IMREAD_COLOR)
-                    if isinstance(bgr, np.ndarray) and bgr.size > 0:
+                    if bgr is not None and bgr.size > 0:
                         cct, temp_bin, exp_bin = _estimate_temp_exposure(bgr)
                 except Exception:
                     pass
@@ -470,14 +579,13 @@ def main():
                 wr.writerow([fn, gaze_bin, eyes_bin, m_bin, s_bin, emo_lbl, yaw_bin, pitch_bin,
                              id_bin, q_bin, temp_bin, exp_bin, int(cleanup_ok), reasons])
 
-                # compute a simple bin score for preview/match hints (not a gate)
+                # preview/match hint
                 pose_center = float(np.clip(1.0 - (abs(yaw_center)/55.0 + abs(pitch_center)/25.0), 0.0, 1.0))
                 expr_bonus = float(smile_val)
                 pnp = _to_float(osf.get('pnp_error')) or 0.0
                 pnp_norm = min(1.0, pnp/0.02)
-                q_norm = float(np.clip((mag - q_lo)/max(1e-9,(q_hi-q_lo)), 0.0, 1.0)) if (use_mf and mag is not None and q_hi>q_lo) else 0.5
                 id_s = float(id_score) if id_score is not None else 0.55
-                bin_score = 0.55*id_s + 0.30*q_norm + 0.10*pose_center + 0.05*expr_bonus - 0.05*pnp_norm
+                bin_score = 0.55*id_s + 0.30*max(-1.0,min(1.0,q_score)) + 0.10*pose_center + 0.05*expr_bonus - 0.05*pnp_norm
 
                 rec = {
                     'file': fn,
@@ -496,18 +604,20 @@ def main():
                     },
                     'scores': {
                         'id_score': id_score,
+                        'q_score': q_score,
                         'q_magface': mag,
                         'pose_centering': pose_center,
                         'expr_strength': smile_val,
                         'pnp_error': pnp,
                         'bin_score': bin_score,
                     },
-                    'pose': {'yaw': yaw, 'pitch': pitch, 'roll': roll},
+                    'pose_deg': {'yaw': yaw, 'pitch': pitch, 'roll': roll},
                     'gaze_deg': {'yaw': gyaw_deg, 'pitch': gpitch_deg},
                     'src': {'of3': of3, 'mp': mp, 'osf': osf, 'af': af, 'mf': mfq, 'fx': fx},
                 }
 
-                outm.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                outm.write(json.dumps(rec, ensure_ascii=False) + "
+")
 
                 # live table
                 elapsed = time.time() - t0
@@ -522,7 +632,6 @@ def main():
             except Exception as e:
                 fails += 1
                 bar.update(processed, fails=fails)
-                # print the first error for visibility; keep quiet after that
                 if fails == 1:
                     print(f"TAG: error on {fn}: {e}")
             finally:

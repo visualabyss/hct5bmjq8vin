@@ -476,7 +476,8 @@ def main():
                     },
                     'pose_deg': {'yaw': yaw, 'pitch': pitch, 'roll': roll},
                 }
-                outm.write(json.dumps(rec, ensure_ascii=False) + "
+                outm.write(json.dumps(rec, ensure_ascii=False))
+                outm.write("
 ")
                 if VERBOSE and (processed < 1 or (processed % 1000 == 0)):
                     print(f"TAG[{processed+1}/{total}] file={fn} yaw_sel={yaw} (of3={yaw_of3} mp={yaw_mp} osf={yaw_osf}) pitch={pitch} gaze={gaze_bin} eyes={eyes_bin} mouth={m_bin} smile={s_bin} id={id_score}=>{id_bin} q={q_bin} ten={ten:.2f} zten={z_ten:.2f} zmag={z_mag:.2f} temp={temp_bin} exp={exp_bin}")

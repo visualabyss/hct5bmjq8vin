@@ -272,6 +272,7 @@ def main():
     if total == 0:
         print("TAG: no images under --aligned.")
         return 2
+    print(f"TAG: config use_of3={use_of3} use_mp={use_mp} use_osf={use_osf} use_af={use_af} use_mf={use_mf}")
     src_maps: Dict[str, Dict[str, Dict[str,str]]] = {}
     if use_of3:
         of3a = _read_csv_map(logs/"openface3"/"openface3.csv")
@@ -287,6 +288,7 @@ def main():
         src_maps['af'] = _read_csv_map(logs/"arcface"/"arcface.csv")
     if use_mf:
         src_maps['mf'] = _read_csv_map(logs/"magface"/"magface.csv")
+    print("TAG: sources sizes", {k: len(v) for k,v in src_maps.items()})
     mp_jaw_list: List[float] = []
     of3_y_deg: List[float] = []
     mp_y_deg: List[float] = []
@@ -318,6 +320,11 @@ def main():
         prefer_of3_yaw = False
     else:
         prefer_of3_yaw = len(of3_y_deg) >= len(mp_y_deg)
+    of3_min = min(of3_y_deg) if of3_y_deg else None
+    of3_max = max(of3_y_deg) if of3_y_deg else None
+    mp_min = min(mp_y_deg) if mp_y_deg else None
+    mp_max = max(mp_y_deg) if mp_y_deg else None
+    print(f"TAG: yaw coverage of3(min={of3_min}, max={of3_max}) mp(min={mp_min}, max={mp_max}) prefer_of3_yaw={prefer_of3_yaw}")
     id_vals = []
     for v in (src_maps.get('af', {}) or {}).values():
         s = _to_float(v.get('id_score') or v.get('cos_ref') or v.get('id_conf') or v.get('cos_sim') or v.get('similarity') or v.get('cosine'))
@@ -325,14 +332,17 @@ def main():
     if id_vals:
         id_mode = 'sim'
         id_thresh = float(np.quantile(id_vals, 0.20))
+        print(f"TAG: arcface id stats n={len(id_vals)} thresh={id_thresh:.3f} min={min(id_vals):.3f} max={max(id_vals):.3f} med={np.median(id_vals):.3f}")
     else:
         id_mode = 'sim'; id_thresh = 0.50
+        print("TAG: arcface id missing, using default threshold 0.50")
     mag_vals = []
     for v in (src_maps.get('mf', {}) or {}).values():
         q = _to_float(v.get('quality') or v.get('mag') or v.get('mag_norm') or v.get('mag_quality'))
         if q is not None: mag_vals.append(float(q))
     mag_mu = float(np.mean(mag_vals)) if mag_vals else 0.0
     mag_sd = float(np.std(mag_vals)+1e-6) if mag_vals else 1.0
+    print(f"TAG: magface stats n={len(mag_vals)} mean={mag_mu:.3f} std={mag_sd:.3f}")
     (logs/"tag").mkdir(parents=True, exist_ok=True)
     try:
         (logs/"tag"/"calib.json").write_text(json.dumps({
@@ -370,6 +380,7 @@ def main():
     ten_mean = 0.0
     ten_m2 = 0.0
     ten_n = 0
+    print(f"TAG: writing tags to {tags_csv} and manifest to {manifest}")
     with tags_csv.open("w", encoding="utf-8", newline="") as fcsv, manifest.open("a", encoding="utf-8") as outm:
         wr = csv.writer(fcsv)
         wr.writerow(["file","gaze_bin","eyes_bin","mouth_bin","smile_bin","emotion_bin","yaw_bin","pitch_bin","id_bin","quality_bin","temp_bin","exposure_bin","cleanup_ok","reasons"])
@@ -419,17 +430,21 @@ def main():
                 if g_mp is not None:
                     gaze_bin = g_mp
                 else:
+                    print(f"TAG: {fn} gaze MP weak -> fallback to head pose")
                     gaze_bin = _gaze_bin(yaw, pitch)
                 eyes_bin = _eyes_state(mp, osf)
                 m_bin, s_bin, teeth, mouth_val, smile_val = _mouth_bins(mp, (jaw_q_lo, jaw_q_hi))
-                emo_lbl = (of3.get('emotion') or '').strip().upper()
-                if emo_lbl not in EMOTION_LABELS: emo_lbl = 'NEUTRAL'
+                emo_raw = (of3.get('emotion') or '').strip()
+                emo_lbl = emo_raw.upper()
+                if emo_lbl not in EMOTION_LABELS:
+                    print(f"TAG: {fn} unknown emotion '{emo_raw}' -> NEUTRAL")
+                    emo_lbl = 'NEUTRAL'
                 cct, temp_bin, exp_bin = None, 'NEUTRAL', 'NORMAL'
                 try:
                     if bgr is not None and bgr.size > 0:
                         cct, temp_bin, exp_bin = _estimate_temp_exposure(bgr)
-                except Exception:
-                    pass
+                except Exception as ee:
+                    print(f"TAG: {fn} temp/exposure failed: {ee}")
                 cleanup_ok, reasons = True, ""
                 for k, v in [("GAZE",gaze_bin),("EYES",eyes_bin),("MOUTH",m_bin),("SMILE",s_bin),("EMOTION",emo_lbl),
                              ("YAW",_yaw_bin(yaw)),("PITCH",_pitch_bin(pitch)),("IDENTITY",id_bin),("QUALITY",q_bin),
@@ -467,7 +482,10 @@ def main():
                     },
                     'pose_deg': {'yaw': yaw, 'pitch': pitch, 'roll': roll},
                 }
-                outm.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                outm.write(json.dumps(rec, ensure_ascii=False) + "
+")
+                if processed < 5 or (processed % 100 == 0):
+                    print(f"TAG[{processed+1}/{total}] file={fn} yaw_sel={yaw} (of3={yaw_of3} mp={yaw_mp} osf={yaw_osf}) pitch={pitch} gaze={gaze_bin} eyes={eyes_bin} mouth={m_bin} smile={s_bin} id={id_score}=>{id_bin} q={q_bin} ten={ten:.2f} zten={z_ten:.2f} zmag={z_mag:.2f} temp={temp_bin} exp={exp_bin}")
                 ten_n += 1
                 delta = ten - ten_mean
                 ten_mean += delta/ten_n
@@ -487,10 +505,15 @@ def main():
                 elapsed = time.time() - t0
                 fps = int(processed/elapsed) if elapsed > 0 else 0
                 bar.update(processed, fails=fails, fps=fps)
-                if fails == 1:
-                    print(f"TAG: error on {fn}: {e}")
+                print(f"TAG: error on {fn}: {e}")
     bar.close()
     print(f"TAG: done. images={total} fails={fails} manifest={manifest}")
+    print("TAG: final counts")
+    try:
+        for k in ['GAZE','EYES','MOUTH','SMILE','EMOTION','YAW','PITCH','IDENTITY','QUALITY','TEMP','EXPOSURE']:
+            print(f"TAG: {k} -> {sections[k]['counts']}")
+    except Exception:
+        pass
     return 0
 
 if __name__ == '__main__':

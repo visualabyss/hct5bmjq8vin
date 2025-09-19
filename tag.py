@@ -20,7 +20,6 @@ IDENTITY_LABELS = ["MATCH","MISMATCH"]
 QUALITY_LABELS  = ["HIGH","MID","LOW"]
 TEMP_LABELS     = ["WARM","NEUTRAL","COOL"]
 EXPOSURE_LABELS = ["UNDER","NORMAL","OVER"]
-AU_KEYS         = ["1","2","4","6","9","12","25","26"]
 SRGB2XYZ = np.array([[0.4124564, 0.3575761, 0.1804375],
                      [0.2126729, 0.7151522, 0.0721750],
                      [0.0193339, 0.1191920, 0.9503041]], dtype=np.float64)
@@ -108,7 +107,7 @@ def _srgb_to_linear(x: np.ndarray) -> np.ndarray:
 def _estimate_cct_xy(x: float, y: float) -> float:
     xe, ye = 0.3320, 0.1858
     n = (x - xe) / (y - ye + 1e-9)
-    return float(np.clip(449.0*(n**3) + 3525.0*(n**2) + 6823.3*n + 5520.33, 1000.0, 25000.0))
+    return float(np.clip(-449.0*(n**3) + 3525.0*(n**2) - 6823.3*n + 5520.33, 1000.0, 25000.0))
 
 def _ellipse_mask(H: int, W: int, shrink: float=0.86) -> np.ndarray:
     m = np.zeros((H,W), np.uint8)
@@ -136,7 +135,7 @@ def _estimate_temp_exposure(bgr: np.ndarray):
     sdr = bgr.astype(np.float64)/255.0
     low = float(((sdr[...,0][m] < 0.02).mean() + (sdr[...,1][m] < 0.02).mean() + (sdr[...,2][m] < 0.02).mean())*100/3)
     hi  = float(((sdr[...,0][m] > 0.98).mean() + (sdr[...,1][m] > 0.98).mean() + (sdr[...,2][m] > 0.98).mean())*100/3)
-    exp_bin = "OVER" if (hi > 0.05 and log_avg > 0.60) else ("UNDER" if (low > 8.0 and log_avg < 0.10) else "NORMAL")
+    exp_bin = "OVER" if (hi > 5.0 and log_avg > 0.60) else ("UNDER" if (low > 8.0 and log_avg < 0.10) else "NORMAL")
     return cct, temp_bin, exp_bin
 
 def _eyes_state(mp: Dict[str,str], osf: Dict[str,str]) -> str:
@@ -180,7 +179,7 @@ def _gaze_from_mp(mp: Dict[str,str]) -> Optional[str]:
     mdir = max(scores, key=scores.get)
     mval = scores[mdir]
     if mval < 0.20:
-        return "FRONT"
+        return None
     return mdir
 
 def _mouth_bins(mp: Dict[str,str], jaw_q: Tuple[float,float]):
@@ -288,7 +287,6 @@ def main():
         src_maps['af'] = _read_csv_map(logs/"arcface"/"arcface.csv")
     if use_mf:
         src_maps['mf'] = _read_csv_map(logs/"magface"/"magface.csv")
-    src_maps['fx'] = _read_csv_map(logs/"video"/"video_stats.csv")
     mp_jaw_list: List[float] = []
     of3_y_deg: List[float] = []
     mp_y_deg: List[float] = []
@@ -312,9 +310,14 @@ def main():
     def yaw_has_both_signs(vals: List[float]) -> bool:
         if not vals: return False
         return (min(vals) < -1.0) and (max(vals) > 1.0)
-    prefer_of3_yaw = yaw_has_both_signs(of3_y_deg)
-    if not prefer_of3_yaw and yaw_has_both_signs(mp_y_deg):
+    use_of3_yaw = yaw_has_both_signs(of3_y_deg)
+    use_mp_yaw = yaw_has_both_signs(mp_y_deg)
+    if use_of3_yaw and not use_mp_yaw:
+        prefer_of3_yaw = True
+    elif use_mp_yaw and not use_of3_yaw:
         prefer_of3_yaw = False
+    else:
+        prefer_of3_yaw = len(of3_y_deg) >= len(mp_y_deg)
     id_vals = []
     for v in (src_maps.get('af', {}) or {}).values():
         s = _to_float(v.get('id_score') or v.get('cos_ref') or v.get('id_conf') or v.get('cos_sim') or v.get('similarity') or v.get('cosine'))
@@ -364,6 +367,9 @@ def main():
     tag_dir = logs/"tag"; tag_dir.mkdir(parents=True, exist_ok=True)
     tags_csv = tag_dir/"tags.csv"
     img_list = _list_images(aligned)
+    ten_mean = 0.0
+    ten_m2 = 0.0
+    ten_n = 0
     with tags_csv.open("w", encoding="utf-8", newline="") as fcsv, manifest.open("a", encoding="utf-8") as outm:
         wr = csv.writer(fcsv)
         wr.writerow(["file","gaze_bin","eyes_bin","mouth_bin","smile_bin","emotion_bin","yaw_bin","pitch_bin","id_bin","quality_bin","temp_bin","exposure_bin","cleanup_ok","reasons"])
@@ -375,7 +381,6 @@ def main():
                 osf = (src_maps.get('osf',{}) or {}).get(fn, {})
                 af  = (src_maps.get('af',{})  or {}).get(fn, {})
                 mfq = (src_maps.get('mf',{})  or {}).get(fn, {})
-                fx  = (src_maps.get('fx',{})  or {}).get(fn, {})
                 raw_id = _to_float(af.get('id_score') or af.get('cos_ref') or af.get('id_conf') or af.get('cos_sim') or af.get('similarity') or af.get('cosine'))
                 if id_mode == 'sim':
                     id_bin = "MATCH" if (raw_id is not None and raw_id >= id_thresh) else "MISMATCH"
@@ -386,7 +391,13 @@ def main():
                 mag = _to_float(mfq.get('quality') or mfq.get('mag') or mfq.get('mag_norm') or mfq.get('mag_quality'))
                 z_mag = ((mag - mag_mu)/mag_sd) if (use_mf and mag is not None) else 0.0
                 bgr = cv2.imread(str(img), cv2.IMREAD_COLOR)
-                z_ten = (_tenengrad(bgr) - 0.0) / 1.0
+                ten = _tenengrad(bgr)
+                if ten_n > 1:
+                    ten_sd = math.sqrt(ten_m2/ten_n)
+                else:
+                    ten_sd = 1.0
+                ten_mu = ten_mean if ten_n > 0 else ten
+                z_ten = (ten - ten_mu) / (ten_sd if ten_sd > 1e-6 else 1.0)
                 q_score = 0.60*z_mag + 0.40*z_ten
                 q_bin = _quality_bin_from_score(q_score)
                 yaw_of3   = _maybe_rad_to_deg(_to_float(of3.get('pose_yaw')   or of3.get('yaw')))
@@ -404,13 +415,11 @@ def main():
                     yaw = yaw_mp if yaw_mp is not None else (yaw_osf if yaw_osf is not None else yaw_of3)
                 pitch = pitch_of3 if pitch_of3 is not None else (pitch_mp if pitch_mp is not None else pitch_osf)
                 roll  = roll_of3 if roll_of3 is not None else (roll_mp if roll_mp is not None else roll_osf)
-                gyaw_deg   = None
-                gpitch_deg = None
                 g_mp = _gaze_from_mp(mp)
                 if g_mp is not None:
                     gaze_bin = g_mp
                 else:
-                    gaze_bin = _gaze_bin(gyaw_deg, gpitch_deg)
+                    gaze_bin = _gaze_bin(yaw, pitch)
                 eyes_bin = _eyes_state(mp, osf)
                 m_bin, s_bin, teeth, mouth_val, smile_val = _mouth_bins(mp, (jaw_q_lo, jaw_q_hi))
                 emo_lbl = (of3.get('emotion') or '').strip().upper()
@@ -459,6 +468,11 @@ def main():
                     'pose_deg': {'yaw': yaw, 'pitch': pitch, 'roll': roll},
                 }
                 outm.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                ten_n += 1
+                delta = ten - ten_mean
+                ten_mean += delta/ten_n
+                ten_m2 += delta*(ten - ten_mean)
+                processed += 1
                 elapsed = time.time() - t0
                 fps = int(processed/elapsed) if elapsed > 0 else 0
                 eta = int((total-processed)/max(1, fps))
@@ -469,11 +483,12 @@ def main():
                 bar.update(processed, fails=fails, fps=fps)
             except Exception as e:
                 fails += 1
-                bar.update(processed, fails=fails)
+                processed += 1
+                elapsed = time.time() - t0
+                fps = int(processed/elapsed) if elapsed > 0 else 0
+                bar.update(processed, fails=fails, fps=fps)
                 if fails == 1:
                     print(f"TAG: error on {fn}: {e}")
-            finally:
-                processed += 1
     bar.close()
     print(f"TAG: done. images={total} fails={fails} manifest={manifest}")
     return 0

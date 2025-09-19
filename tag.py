@@ -69,16 +69,6 @@ def _to_float(x) -> Optional[float]:
     except Exception:
         return None
 
-def _sigmoid(v: Optional[float]) -> Optional[float]:
-    if v is None:
-        return None
-    try:
-        if 0.0 <= v <= 1.0:
-            return v
-        return 1.0/(1.0+math.exp(-float(v)))
-    except Exception:
-        return None
-
 def _maybe_rad_to_deg(v: Optional[float]) -> Optional[float]:
     if v is None: return None
     a = abs(v)
@@ -482,8 +472,7 @@ def main():
                     },
                     'pose_deg': {'yaw': yaw, 'pitch': pitch, 'roll': roll},
                 }
-                outm.write(json.dumps(rec, ensure_ascii=False) + "
-")
+                outm.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 if processed < 5 or (processed % 100 == 0):
                     print(f"TAG[{processed+1}/{total}] file={fn} yaw_sel={yaw} (of3={yaw_of3} mp={yaw_mp} osf={yaw_osf}) pitch={pitch} gaze={gaze_bin} eyes={eyes_bin} mouth={m_bin} smile={s_bin} id={id_score}=>{id_bin} q={q_bin} ten={ten:.2f} zten={z_ten:.2f} zmag={z_mag:.2f} temp={temp_bin} exp={exp_bin}")
                 ten_n += 1

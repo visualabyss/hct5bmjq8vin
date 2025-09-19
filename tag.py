@@ -22,7 +22,7 @@ GAZE_LABELS     = ["FRONT","LEFT","RIGHT","UP","DOWN"]
 EYES_LABELS     = ["OPEN","HALF","CLOSED","W-LEFT","W-RIGHT"]
 MOUTH_LABELS    = ["OPEN","SLIGHT","CLOSE"]
 SMILE_LABELS    = ["TEETH","CLOSED","NONE"]
-EMOTION_LABELS  = ["NEUTRAL","HAPPY","SAD","SUPRISE","FEAR","DISGUST","ANGER","CONTEMPT"]
+EMOTION_LABELS  = ["NEUTRAL","HAPPY","SAD","SURPRISE","FEAR","DISGUST","ANGER","CONTEMPT"]
 YAW_LABELS      = ["FRONT","LEFT","RIGHT","3/4 LEFT","3/4 RIGHT","PROF LEFT","PROF RIGHT"]
 PITCH_LABELS    = ["LEVEL","CHIN UP","CHIN DOWN"]
 IDENTITY_LABELS = ["MATCH","MISMATCH"]
@@ -471,7 +471,7 @@ def main():
     img_list = _list_images(aligned)
     with tags_csv.open("w", encoding="utf-8", newline="") as fcsv, manifest.open("a", encoding="utf-8") as outm:
         wr = csv.writer(fcsv)
-        wr.writerow(["file","pose_bin","eyes_bin","mouth_bin","smile_bin","emotion_bin","yaw_bin","pitch_bin",
+        wr.writerow(["file","gaze_bin","eyes_bin","mouth_bin","smile_bin","emotion_bin","yaw_bin","pitch_bin",
                      "id_bin","quality_bin","temp_bin","exposure_bin","cleanup_ok","reasons"])  # stable header
 
         for img in img_list:
@@ -616,8 +616,7 @@ def main():
                     'src': {'of3': of3, 'mp': mp, 'osf': osf, 'af': af, 'mf': mfq, 'fx': fx},
                 }
 
-                outm.write(json.dumps(rec, ensure_ascii=False) + "
-")
+                outm.write(json.dumps(rec, ensure_ascii=False) + "\\n")
 
                 # live table
                 elapsed = time.time() - t0

@@ -23,6 +23,7 @@ EXPOSURE_LABELS = ["UNDER","NORMAL","OVER"]
 SRGB2XYZ = np.array([[0.4124564, 0.3575761, 0.1804375],
                      [0.2126729, 0.7151522, 0.0721750],
                      [0.0193339, 0.1191920, 0.9503041]], dtype=np.float64)
+VERBOSE = os.environ.get("TAG_VERBOSE", "0").strip().lower() in {"1","true","on","yes","y"}
 
 def _onoff(v, default=False) -> bool:
     if isinstance(v, bool):
@@ -420,21 +421,24 @@ def main():
                 if g_mp is not None:
                     gaze_bin = g_mp
                 else:
-                    print(f"TAG: {fn} gaze MP weak -> fallback to head pose")
+                    if VERBOSE:
+                        print(f"TAG: {fn} gaze MP weak -> fallback to head pose")
                     gaze_bin = _gaze_bin(yaw, pitch)
                 eyes_bin = _eyes_state(mp, osf)
                 m_bin, s_bin, teeth, mouth_val, smile_val = _mouth_bins(mp, (jaw_q_lo, jaw_q_hi))
                 emo_raw = (of3.get('emotion') or '').strip()
                 emo_lbl = emo_raw.upper()
                 if emo_lbl not in EMOTION_LABELS:
-                    print(f"TAG: {fn} unknown emotion '{emo_raw}' -> NEUTRAL")
+                    if VERBOSE:
+                        print(f"TAG: {fn} unknown emotion '{emo_raw}' -> NEUTRAL")
                     emo_lbl = 'NEUTRAL'
                 cct, temp_bin, exp_bin = None, 'NEUTRAL', 'NORMAL'
                 try:
                     if bgr is not None and bgr.size > 0:
                         cct, temp_bin, exp_bin = _estimate_temp_exposure(bgr)
                 except Exception as ee:
-                    print(f"TAG: {fn} temp/exposure failed: {ee}")
+                    if VERBOSE:
+                        print(f"TAG: {fn} temp/exposure failed: {ee}")
                 cleanup_ok, reasons = True, ""
                 for k, v in [("GAZE",gaze_bin),("EYES",eyes_bin),("MOUTH",m_bin),("SMILE",s_bin),("EMOTION",emo_lbl),
                              ("YAW",_yaw_bin(yaw)),("PITCH",_pitch_bin(pitch)),("IDENTITY",id_bin),("QUALITY",q_bin),
@@ -472,8 +476,9 @@ def main():
                     },
                     'pose_deg': {'yaw': yaw, 'pitch': pitch, 'roll': roll},
                 }
-                outm.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                if processed < 5 or (processed % 100 == 0):
+                outm.write(json.dumps(rec, ensure_ascii=False) + "
+")
+                if VERBOSE and (processed < 1 or (processed % 1000 == 0)):
                     print(f"TAG[{processed+1}/{total}] file={fn} yaw_sel={yaw} (of3={yaw_of3} mp={yaw_mp} osf={yaw_osf}) pitch={pitch} gaze={gaze_bin} eyes={eyes_bin} mouth={m_bin} smile={s_bin} id={id_score}=>{id_bin} q={q_bin} ten={ten:.2f} zten={z_ten:.2f} zmag={z_mag:.2f} temp={temp_bin} exp={exp_bin}")
                 ten_n += 1
                 delta = ten - ten_mean

@@ -1,16 +1,3 @@
 
-PURPOSE
-  • Consolidate tool outputs into manifest.jsonl and live bin_table.txt.
-  • Fusion of pose/gaze/eyes/mouth/smile/teeth + quality/identity + temp/exposure (face-only).
-
-FLAGS
-  --aligned DIR (req)              aligned images dir
-  --logs DIR (req)                 logs root (writes manifest.jsonl, bin_table.txt)
-  --openface3 on|off (on)          include OF3 readers if present
-  --mediapipe on|off (on)          include MediaPipe readers if present
-  --openseeface on|off (on)        include OpenSeeFace readers if present
-  --arcface on|off (on)            include ArcFace readers if present
-  --magface on|off (off)           include MagFace readers if present
-  --override (flag)                overwrite manifest.jsonl instead of appending
-  --help on|off (on)               write /workspace/scripts/tag.txt then proceed
-  -h / --h                         print this help text and continue
+--aligned DIR  --logs DIR  [--openface3 on|off] [--mediapipe on|off] [--openseeface on|off]
+[--arcface on|off] [--magface on|off] [--override] [--help on|off] [-h|--h]

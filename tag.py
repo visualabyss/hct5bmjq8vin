@@ -458,8 +458,7 @@ def main():
                     },
                     'pose_deg': {'yaw': yaw, 'pitch': pitch, 'roll': roll},
                 }
-                outm.write(json.dumps(rec, ensure_ascii=False) + "
-")
+                outm.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 elapsed = time.time() - t0
                 fps = int(processed/elapsed) if elapsed > 0 else 0
                 eta = int((total-processed)/max(1, fps))

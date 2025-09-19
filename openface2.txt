@@ -1,0 +1,4 @@
+
+--aligned DIR --logs DIR [--download on|off] [--binary PATH] [--override]
+[--img_tool auto|img|seq] [--extra_args "..."] [--help on|off]
+Outputs: logs/openface2/openface2.csv and metadata to logs/openface2/.

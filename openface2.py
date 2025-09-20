@@ -40,43 +40,53 @@ def _count_rows(work_dir: Path) -> int:
     return total
 
 
-def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional[Dict[str,str]] = None) -> int:
+def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional[Dict[str,str]] = None, out_csv: Optional[Path] = None) -> int:
     bar = ProgressBar("OPENFACE2", total=total, show_fail_label=True)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
     start = time.time()
-    seen: set = set()
-    # baseline: do not count pre-existing files as progress
-    for e in os.scandir(work_dir):
-        if e.is_file() and e.name.lower().endswith('.csv'):
-            seen.add(e.name)
-    processed = len(seen)
-    bar.update(min(processed, total), fails=0, fps=0)
     try:
+        processed = 0
+        bar.update(0, fails=0, fps=0)
         while True:
-            # swallow tool output to keep console quiet
             if p.stdout:
                 _ = p.stdout.readline()
-            # detect new per-image CSVs
-            new_cnt = 0
-            for e in os.scandir(work_dir):
-                if not e.is_file():
-                    continue
-                if not e.name.lower().endswith('.csv'):
-                    continue
-                if e.name not in seen:
-                    seen.add(e.name)
-                    new_cnt += 1
-            if new_cnt:
-                processed += new_cnt
+            if out_csv is not None and out_csv.exists():
+                try:
+                    with out_csv.open('r', encoding='utf-8', newline='') as f:
+                        c = sum(1 for _ in f)
+                    new_processed = max(0, c - 1)
+                except Exception:
+                    new_processed = processed
+            else:
+                new_processed = sum(1 for e in os.scandir(work_dir) if e.is_file() and e.name.lower().endswith('.csv'))
+            if new_processed != processed:
+                processed = new_processed
                 elapsed = max(1e-6, time.time() - start)
                 fps = int(processed / elapsed)
                 bar.update(min(processed, total), fails=0, fps=fps)
             if p.poll() is not None:
                 break
-            time.sleep(0.02)
+            time.sleep(0.05)
         rc = p.wait()
+        bar.update(min(processed, total), fails=0)
         bar.close()
         return int(rc)
+    except KeyboardInterrupt:
+        try:
+            p.terminate()
+            try:
+                p.wait(timeout=3)
+            except Exception:
+                p.kill()
+        finally:
+            bar.close()
+        return 130
+    finally:
+        try:
+            if p and (p.poll() is None):
+                p.terminate()
+        except Exception:
+            pass
     except KeyboardInterrupt:
         try:
             p.terminate()
@@ -243,7 +253,7 @@ def main():
         print("[OF2] no images under --aligned")
         return 2
 
-    prefer = "FeatureExtraction"  # force CSV-streaming tool
+    prefer = "FeatureExtraction"  # use sequence tool for -fdir so we can tail a single CSV
     bin_user = Path(args.binary) if args.binary else None
     bin_path = _find_binary(repo_dir, bin_user, prefer)
     if not bin_path:
@@ -254,13 +264,14 @@ def main():
         print("[OF2] ERROR: OpenFace binary not found. Build failed or wrong platform.")
         return 3
 
-    cmd = [str(bin_path), "-fdir", str(aligned), "-out_dir", str(work_dir), "-pose", "-gaze", "-aus"]
+    out_name = "openface2.csv"
+    cmd = [str(bin_path), "-fdir", str(aligned), "-out_dir", str(work_dir), "-pose", "-gaze", "-aus", "-au_static", "-q", "-of", out_name]
     if args.extra_args.strip():
         cmd += args.extra_args.strip().split()
     print("[OF2] running:", " ".join(cmd))
 
     try:
-        rc = _run_with_progress(cmd, work_dir, total=len(images), env=env)
+        rc = _run_with_progress(cmd, work_dir, total=len(images), env=env, out_csv=(work_dir/"openface2.csv"))
     except KeyboardInterrupt:
         print("[OF2] interrupted")
         return 130

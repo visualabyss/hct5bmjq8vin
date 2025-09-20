@@ -1,3 +1,3 @@
 
---aligned DIR  --logs DIR  [--openface3 on|off] [--mediapipe on|off] [--openseeface on|off]
+--aligned DIR  --logs DIR  [--openface2 on|off] [--openface3 on|off] [--mediapipe on|off] [--openseeface on|off]
 [--arcface on|off] [--magface on|off] [--override] [--help on|off] [-h|--h]

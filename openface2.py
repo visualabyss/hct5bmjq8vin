@@ -4,23 +4,15 @@ import os, sys, csv, json, argparse, subprocess, time
 from pathlib import Path
 from typing import List, Optional, Dict
 import math
+from progress import ProgressBar
 
 IMAGE_EXTS = {".jpg",".jpeg",".png",".bmp",".webp"}
+
 AUTO_HELP = r"""
 --aligned DIR --logs DIR [--download on|off] [--binary PATH] [--override]
 [--img_tool auto|img|seq] [--extra_args "..."] [--help on|off]
-Outputs: logs/openface2/openface2.csv and metadata to logs/openface2/.
+Outputs: logs/openface2/per_image/*.csv and a merged logs/openface2/openface2.csv
 """
-
-try:
-    from progress import ProgressBar  # type: ignore
-except Exception:
-    class ProgressBar:  # minimal fallback
-        def __init__(self, name, total=0, show_fail_label=False): self.name=name; self.total=int(total or 0)
-        def update(self, i, fails=0, fps=0):
-            if self.total and ((i % 200==0) or i==self.total):
-                pct=100.0*i/max(1,self.total); print(f"[{self.name}] {i}/{self.total} {pct:5.1f}% fails={fails} fps={fps}")
-        def close(self): pass
 
 
 def _onoff(v, default=False) -> bool:
@@ -36,20 +28,49 @@ def _list_images(d: Path) -> List[Path]:
     return [p for p in sorted(d.iterdir()) if p.suffix.lower() in IMAGE_EXTS]
 
 
-def _run(cmd: List[str], cwd: Optional[Path]=None, env: Optional[Dict[str,str]]=None) -> int:
-    p = subprocess.Popen(cmd, cwd=str(cwd) if cwd else None,
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                         text=True, bufsize=1, env=env)
+def _count_rows(work_dir: Path) -> int:
+    total = 0
+    for p in work_dir.rglob('*.csv'):
+        try:
+            with p.open('r', encoding='utf-8', newline='') as f:
+                n = sum(1 for _ in f)
+                if n > 1:
+                    total += (n - 1)
+        except Exception:
+            pass
+    return total
+
+
+def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional[Dict[str,str]] = None) -> int:
+    bar = ProgressBar("OPENFACE2", total=total, show_fail_label=True)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
     start = time.time()
-    while True:
-        line = p.stdout.readline() if p.stdout else ""
-        if not line and p.poll() is not None:
-            break
-        if line:
-            print(line.rstrip())
-    rc = p.wait()
-    print(f"[OF2] cmd done in {time.time()-start:.1f}s rc={rc}")
-    return int(rc)
+    last_tick = 0.0
+    processed = 0
+    try:
+        while True:
+            line = p.stdout.readline() if p.stdout else ""
+            if line:
+                L = line.rstrip()
+                if ("warn" in L.lower()):
+                    L = ""
+            now = time.time()
+            if (now - last_tick) >= 1.0:
+                processed = _count_rows(work_dir)
+                fps = int(processed/max(1, int(now - start)))
+                bar.update(min(processed, total), fails=0, fps=fps)
+                last_tick = now
+            if not line and p.poll() is not None:
+                break
+        rc = p.wait()
+        processed = _count_rows(work_dir)
+        fps = int(processed/max(1, int(time.time() - start)))
+        bar.update(min(processed, total), fails=0, fps=fps)
+        bar.close()
+        return int(rc)
+    finally:
+        try: bar.close()
+        except Exception: pass
 
 
 def _ensure_repo(repo_dir: Path, download: bool) -> None:
@@ -58,10 +79,10 @@ def _ensure_repo(repo_dir: Path, download: bool) -> None:
     if not download:
         return
     repo_dir.parent.mkdir(parents=True, exist_ok=True)
-    _run(["git","clone","--depth","1","https://github.com/TadasBaltrusaitis/OpenFace", str(repo_dir)])
+    subprocess.check_call(["git","clone","--depth","1","https://github.com/TadasBaltrusaitis/OpenFace", str(repo_dir)])
     models = repo_dir/"download_models.sh"
     if models.exists():
-        _run(["bash", str(models)])
+        subprocess.call(["bash", str(models)])
 
 
 def _find_binary(repo_dir: Path, user_path: Optional[Path], tool: str) -> Optional[Path]:
@@ -86,25 +107,23 @@ def _ensure_built(repo_dir: Path) -> None:
         return
     inst = repo_dir/"install.sh"
     if inst.exists():
-        _run(["bash", str(inst)], cwd=repo_dir)
+        subprocess.call(["bash", str(inst)], cwd=repo_dir)
         fe = _find_binary(repo_dir, None, "FeatureExtraction")
         fl = _find_binary(repo_dir, None, "FaceLandmarkImg")
         if fe or fl:
             return
     build = repo_dir/"build"
     build.mkdir(parents=True, exist_ok=True)
-    _run(["cmake","-D","CMAKE_BUILD_TYPE=Release",".."], cwd=build)
-    _run(["make", f"-j{max(1, os.cpu_count() or 1)}"], cwd=build)
+    subprocess.check_call(["cmake","-D","CMAKE_BUILD_TYPE=Release",".."], cwd=build)
+    subprocess.check_call(["make", f"-j{max(1, os.cpu_count() or 1)}"], cwd=build)
 
 
 def _inject_env(repo_dir: Path) -> Dict[str,str]:
     env = os.environ.copy()
     env["OF2_HOME"] = str(repo_dir)
-    path = env.get("PATH", "")
-    env["PATH"] = str(repo_dir/"build"/"bin") + os.pathsep + str(repo_dir/"bin") + os.pathsep + path
-    ld = env.get("LD_LIBRARY_PATH", "")
-    env["LD_LIBRARY_PATH"] = str(repo_dir/"build"/"lib") + os.pathsep + \
-                               "/usr/local/lib" + os.pathsep + ld
+    env["PATH"] = str(repo_dir/"build"/"bin") + os.pathsep + str(repo_dir/"bin") + os.pathsep + env.get("PATH", "")
+    env["LD_LIBRARY_PATH"] = str(repo_dir/"build"/"lib") + os.pathsep + "/usr/local/lib" + os.pathsep + env.get("LD_LIBRARY_PATH","")
+    env["OPENCV_LOG_LEVEL"] = "ERROR"
     return env
 
 
@@ -169,6 +188,7 @@ def main():
     aligned = Path(args.aligned)
     logs = Path(args.logs)
     out_root = logs/"openface2"; out_root.mkdir(parents=True, exist_ok=True)
+    work_dir = out_root/"per_image"; work_dir.mkdir(parents=True, exist_ok=True)
     repo_dir = Path(os.environ.get("OF2_HOME", "/workspace/tools/OpenFace"))
 
     _ensure_repo(repo_dir, _onoff(args.download, True))
@@ -193,31 +213,27 @@ def main():
         print("[OF2] ERROR: OpenFace binary not found. Build failed or wrong platform.")
         return 3
 
-    work_dir = out_root/"processed"; work_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd = [str(bin_path)]
-    cmd += ["-fdir", str(aligned)]
-    cmd += ["-out_dir", str(work_dir), "-pose", "-gaze", "-aus"]
+    cmd = [str(bin_path), "-fdir", str(aligned), "-out_dir", str(work_dir), "-pose", "-gaze", "-aus"]
     if args.extra_args.strip():
         cmd += args.extra_args.strip().split()
-
     print("[OF2] running:", " ".join(cmd))
-    rc = _run(cmd, env=env)
+
+    rc = _run_with_progress(cmd, work_dir, total=len(images), env=env)
     if rc != 0:
         print("[OF2] ERROR: tool failed")
         return rc
 
-    of_csv = None
-    cands = list(work_dir.rglob("*.csv"))
-    if cands:
-        cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        of_csv = cands[0]
-    if not of_csv:
+    csv_files = sorted(work_dir.rglob("*.csv"))
+    if not csv_files:
         print("[OF2] ERROR: no CSV produced under", work_dir)
         return 4
 
-    print("[OF2] parsing:", of_csv)
-    rows = _read_of_csv(of_csv, images)
+    rows: List[Dict[str,object]] = []
+    for c in csv_files:
+        try:
+            rows.extend(_read_of_csv(c, images))
+        except Exception:
+            pass
 
     out_csv = out_root/"openface2.csv"
     if args.override and out_csv.exists():
@@ -225,8 +241,8 @@ def main():
         except Exception: pass
 
     seen = set()
-    total = len(rows)
-    bar = ProgressBar("OPENFACE2", total=total, show_fail_label=True)
+    total_rows = len(rows)
+    bar2 = ProgressBar("OF2-MERGE", total=total_rows, show_fail_label=True)
     t0 = time.time(); processed=0; fails=0
     write_header = not out_csv.exists()
     with out_csv.open("a", encoding="utf-8", newline="") as f:
@@ -236,31 +252,31 @@ def main():
         for r in rows:
             try:
                 key = r["file"]
-                if key in seen: 
+                if key in seen:
+                    processed += 1
+                    bar2.update(processed, fails=fails)
                     continue
                 seen.add(key)
                 wr.writerow([r["file"], r["yaw"], r["pitch"], r["roll"], r["gaze_x"], r["gaze_y"], r["success"], r["confidence"], r["AU45_r"], r["AU25_r"], r["AU26_r"]])
                 processed += 1
-                elapsed = time.time()-t0
-                fps = int(processed/max(1,elapsed))
-                bar.update(processed, fails=fails, fps=fps)
-            except Exception as e:
-                print("[OF2] row error:", e)
+                fps = int(processed/max(1,int(time.time()-t0)))
+                bar2.update(processed, fails=fails, fps=fps)
+            except Exception:
                 fails += 1
                 processed += 1
-                bar.update(processed, fails=fails)
-    bar.close()
+                bar2.update(processed, fails=fails)
+    bar2.close()
 
     meta = {
         "repo": str(repo_dir),
         "input": str(aligned),
         "out_csv": str(out_csv),
-        "source_csv": str(of_csv),
-        "count": processed,
+        "per_image": str(work_dir),
+        "count": len(seen),
         "binary": str(bin_path),
     }
     (out_root/"of2_meta.json").write_text(json.dumps(meta, indent=2), encoding='utf-8')
-    print(f"[OF2] done rows={processed} fails={fails} -> {out_csv}")
+    print(f"[OF2] done rows={len(seen)} -> {out_csv}")
     return 0
 
 if __name__ == '__main__':

@@ -40,21 +40,48 @@ def _count_rows(work_dir: Path) -> int:
     return total
 
 
-def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional[Dict[str,str]] = None, out_csv: Optional[Path] = None) -> int:
+def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional[Dict[str,str]] = None, aligned_name: Optional[str] = None, force_of: Optional[str] = None) -> int:
     bar = ProgressBar("OPENFACE2", total=total, show_fail_label=True)
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
+    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True, bufsize=0, env=env)
     start = time.time()
     processed = 0
     fps = 0
     bar.update(0, fails=0, fps=0)
+
+    def pick_csv() -> Optional[Path]:
+        cands = []
+        if force_of:
+            cands.append(work_dir/force_of)
+            cands.append(work_dir/"processed"/force_of)
+        if aligned_name:
+            an = f"{aligned_name}.csv"
+            cands += [work_dir/an, work_dir/"processed"/an, work_dir/Path(aligned_name)/an]
+        newest = None; newest_t = -1
+        for root,_,files in os.walk(work_dir):
+            for fn in files:
+                if not fn.lower().endswith('.csv'):
+                    continue
+                pth = Path(root)/fn
+                try:
+                    t = pth.stat().st_mtime
+                except Exception:
+                    continue
+                for c in cands:
+                    if pth == c and pth.exists():
+                        return pth
+                if t > newest_t:
+                    newest_t = t; newest = pth
+        return newest
+
+    csv_path: Optional[Path] = None
     try:
         while True:
-            if p.stdout:
-                _ = p.stdout.readline()
+            if csv_path is None:
+                csv_path = pick_csv()
             new_processed = processed
-            if out_csv is not None and out_csv.exists():
+            if csv_path and csv_path.exists():
                 try:
-                    with out_csv.open('r', encoding='utf-8', newline='') as f:
+                    with csv_path.open('r', encoding='utf-8', newline='') as f:
                         c = sum(1 for _ in f)
                     new_processed = max(0, c - 1)
                 except Exception:
@@ -66,11 +93,21 @@ def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional
                 bar.update(min(processed, total), fails=0, fps=fps)
             if p.poll() is not None:
                 break
-            time.sleep(0.02)
+            time.sleep(0.05)
         rc = p.wait()
         bar.update(min(processed, total), fails=0, fps=fps)
         bar.close()
         return int(rc)
+    except KeyboardInterrupt:
+        try:
+            p.terminate()
+            try:
+                p.wait(timeout=3)
+            except Exception:
+                p.kill()
+        finally:
+            bar.close()
+        return 130
     except KeyboardInterrupt:
         try:
             p.terminate()
@@ -243,14 +280,14 @@ def main():
         print("[OF2] ERROR: OpenFace binary not found. Build failed or wrong platform.")
         return 3
 
-    out_name = "openface2.csv"
-    cmd = [str(bin_path), "-fdir", str(aligned), "-out_dir", str(work_dir), "-pose", "-gaze", "-aus", "-au_static", "-q", "-of", out_name]
+    out_name = f"{aligned.name}.csv"
+    cmd = [str(bin_path), "-fdir", str(aligned), "-out_dir", str(work_dir), "-pose", "-gaze", "-aus", "-au_static", "-of", out_name]
     if args.extra_args.strip():
         cmd += args.extra_args.strip().split()
     print("[OF2] running:", " ".join(cmd))
 
     try:
-        rc = _run_with_progress(cmd, work_dir, total=len(images), env=env, out_csv=(work_dir/"openface2.csv"))
+        rc = _run_with_progress(cmd, work_dir, total=len(images), env=env, aligned_name=aligned.name, force_of=out_name)
     except KeyboardInterrupt:
         print("[OF2] interrupted")
         return 130

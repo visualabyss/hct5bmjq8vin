@@ -110,18 +110,8 @@ def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional
         finally:
             bar.close()
         return 130
-    except KeyboardInterrupt:
-        try:
-            p.terminate()
-            try:
-                p.wait(timeout=3)
-            except Exception:
-                p.kill()
-        finally:
-            bar.close()
-        return 130
 
-def _ensure_repo(repo_dir: Path, download: bool) -> None:
+def _ensure_repo(repo_dir: Path, download: bool) -> None:(repo_dir: Path, download: bool) -> None:
     if repo_dir.exists() and (repo_dir/".git").exists():
         return
     if not download:
@@ -276,7 +266,7 @@ def main():
 
     images = _list_images(aligned)
     if VERBOSE:
-        print(f"[OF2] images={len(images)} aligned={aligned}")
+            print(f"[OF2] images={len(images)} aligned={aligned}")
     if not images:
         if VERBOSE:
             print("[OF2] no images under --aligned")
@@ -366,8 +356,12 @@ def main():
         "per_image": str(work_dir),
         "count": len(seen),
         "binary": str(bin_path),
-        "au_cols": au_cols,
-        "gaze_extra": gaze_extra,
+        "pose_cols": pose_cols,
+        "gaze_cols": gaze_cols,
+        "au_r_cols": au_r_cols,
+        "au_c_cols": au_c_cols,
+        "has_frame": has_frame,
+        "has_timestamp": has_ts,
     }
     (out_root/"of2_meta.json").write_text(json.dumps(meta, indent=2), encoding='utf-8')
     print(f"[OF2] done rows={len(seen)} -> {out_csv}")

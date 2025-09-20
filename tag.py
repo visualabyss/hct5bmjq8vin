@@ -126,7 +126,7 @@ def _estimate_temp_exposure(bgr: np.ndarray):
     sdr = bgr.astype(np.float64)/255.0
     low = float(((sdr[...,0][m] < 0.02).mean() + (sdr[...,1][m] < 0.02).mean() + (sdr[...,2][m] < 0.02).mean())*100/3)
     hi  = float(((sdr[...,0][m] > 0.98).mean() + (sdr[...,1][m] > 0.98).mean() + (sdr[...,2][m] > 0.98).mean())*100/3)
-    exp_bin = "OVER" if (hi > 5.0 and log_avg > 0.60) else ("UNDER" if (low > 8.0 and log_avg < 0.10) else "NORMAL")
+    exp_bin = "OVER" if (hi > 2.0 or log_avg > 0.65) else ("UNDER" if (low > 10.0 and log_avg < 0.08) else "NORMAL")
     return cct, temp_bin, exp_bin
 
 def _eyes_state(mp: Dict[str,str], osf: Dict[str,str]) -> str:
@@ -144,13 +144,13 @@ def _eyes_state(mp: Dict[str,str], osf: Dict[str,str]) -> str:
         return "OPEN"
     diff = (open_l - open_r)
     avg  = 0.5*(open_l + open_r)
-    if abs(diff) >= 0.35 and ((open_l > 0.35) or (open_r > 0.35)):
+    if abs(diff) >= 0.25 and (min(open_l, open_r) <= 0.25) and (max(open_l, open_r) >= 0.45):
         return "W-LEFT" if diff < 0 else "W-RIGHT"
     wide = ((ewl or 0.0) + (ewr or 0.0)) * 0.5
     squi = ((esl or 0.0) + (esr or 0.0)) * 0.5
-    if avg >= 0.55 or wide >= 0.30:
+    if avg >= 0.50 or wide >= 0.30:
         return "OPEN"
-    if avg >= 0.30 and squi < 0.65:
+    if 0.25 <= avg < 0.50 and squi < 0.65:
         return "HALF"
     return "CLOSED"
 
@@ -164,37 +164,36 @@ def _gaze_from_mp(mp: Dict[str,str]) -> Optional[str]:
     L_out  = g('eyeLookOutLeft');   R_out  = g('eyeLookOutRight')
     left_s  = L_out + R_in
     right_s = L_in  + R_out
-    up_s    = L_up  + R_up
-    down_s  = L_dn  + R_dn
+    up_s    = 0.9*(L_up  + R_up)
+    down_s  = 0.9*(L_dn  + R_dn)
     scores = {'LEFT':left_s, 'RIGHT':right_s, 'UP':up_s, 'DOWN':down_s}
-    mdir = max(scores, key=scores.get)
-    mval = scores[mdir]
-    if mval < 0.20:
+    top = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    mdir, mval = top[0]
+    sval = top[1][1]
+    if (mval < 0.30) or ((mval - sval) < 0.12):
         return None
     return mdir
 
 def _mouth_bins(mp: Dict[str,str], jaw_q: Tuple[float,float]):
     def gs(k: str) -> Optional[float]:
         return _to_float(mp.get(f'blend::{k}') or mp.get(k))
-    jaw = gs('jawOpen')
+    jaw = gs('jawOpen') or 0.0
     sL  = gs('mouthSmileLeft')
     sR  = gs('mouthSmileRight')
-    j_lo, j_hi = jaw_q
-    j = jaw if jaw is not None else 0.0
-    if j >= max(0.35, j_hi*0.95):
+    if jaw >= 0.28:
         m_bin = "OPEN"
-    elif j >= max(0.20, j_lo):
+    elif jaw >= 0.12:
         m_bin = "SLIGHT"
     else:
         m_bin = "CLOSE"
     smile_score = max([v for v in [sL,sR] if v is not None] or [0.0])
-    if m_bin == "OPEN" and smile_score >= 0.45:
+    if (smile_score >= 0.30) and (jaw >= 0.18):
         s_bin, teeth = "TEETH", True
-    elif smile_score >= 0.40:
+    elif smile_score >= 0.25:
         s_bin, teeth = "CLOSED", False
     else:
         s_bin, teeth = "NONE", False
-    return m_bin, s_bin, teeth, float(j), float(smile_score)
+    return m_bin, s_bin, teeth, float(jaw), float(smile_score)
 
 def _gaze_bin(gy_deg: Optional[float], gp_deg: Optional[float]) -> str:
     if gy_deg is None and gp_deg is None:
@@ -218,6 +217,9 @@ def _yaw_bin(yaw_deg: Optional[float]) -> str:
 
 def _pitch_bin(pitch_deg: Optional[float]) -> str:
     if pitch_deg is None: return "LEVEL"
+    if pitch_deg >= 10: return "CHIN UP"
+    if pitch_deg <= -10: return "CHIN DOWN"
+    return "LEVEL"
     if pitch_deg >= 15: return "CHIN UP"
     if pitch_deg <= -15: return "CHIN DOWN"
     return "LEVEL"
@@ -400,7 +402,7 @@ def main():
                     ten_sd = 1.0
                 ten_mu = ten_mean if ten_n > 0 else ten
                 z_ten = (ten - ten_mu) / (ten_sd if ten_sd > 1e-6 else 1.0)
-                q_score = 0.60*z_mag + 0.40*z_ten
+                q_score = (0.60*z_mag + 0.40*z_ten) if (use_mf and mag is not None) else z_ten
                 q_bin = _quality_bin_from_score(q_score)
                 yaw_of3   = _maybe_rad_to_deg(_to_float(of3.get('pose_yaw')   or of3.get('yaw')))
                 pitch_of3 = _maybe_rad_to_deg(_to_float(of3.get('pose_pitch') or of3.get('pitch')))
@@ -415,7 +417,7 @@ def main():
                     yaw = yaw_of3
                 else:
                     yaw = yaw_mp if yaw_mp is not None else (yaw_osf if yaw_osf is not None else yaw_of3)
-                pitch = pitch_of3 if pitch_of3 is not None else (pitch_mp if pitch_mp is not None else pitch_osf)
+                pitch = pitch_mp if pitch_mp is not None else (pitch_of3 if pitch_of3 is not None else pitch_osf)
                 roll  = roll_of3 if roll_of3 is not None else (roll_mp if roll_mp is not None else roll_osf)
                 g_mp = _gaze_from_mp(mp)
                 if g_mp is not None:
@@ -476,7 +478,7 @@ def main():
                     },
                     'pose_deg': {'yaw': yaw, 'pitch': pitch, 'roll': roll},
                 }
-                outm.write(json.dumps(rec, ensure_ascii=False) + "\\n")
+                outm.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
                 if VERBOSE and (processed < 1 or (processed % 1000 == 0)):
                     print(f"TAG[{processed+1}/{total}] file={fn} yaw_sel={yaw} (of3={yaw_of3} mp={yaw_mp} osf={yaw_osf}) pitch={pitch} gaze={gaze_bin} eyes={eyes_bin} mouth={m_bin} smile={s_bin} id={id_score}=>{id_bin} q={q_bin} ten={ten:.2f} zten={z_ten:.2f} zmag={z_mag:.2f} temp={temp_bin} exp={exp_bin}")

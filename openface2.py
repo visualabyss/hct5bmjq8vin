@@ -111,7 +111,7 @@ def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional
             bar.close()
         return 130
 
-def _ensure_repo(repo_dir: Path, download: bool) -> None:(repo_dir: Path, download: bool) -> None:
+def _ensure_repo(repo_dir: Path, download: bool) -> None:
     if repo_dir.exists() and (repo_dir/".git").exists():
         return
     if not download:
@@ -277,7 +277,7 @@ def main():
     bin_path = _find_binary(repo_dir, bin_user, prefer)
     if not bin_path:
         if VERBOSE:
-        print("[OF2] building OpenFace...")
+            print("[OF2] building OpenFace...")
         _ensure_built(repo_dir)
         bin_path = _find_binary(repo_dir, None, prefer)
     if not bin_path:

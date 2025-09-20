@@ -44,12 +44,14 @@ def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional
     bar = ProgressBar("OPENFACE2", total=total, show_fail_label=True)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
     start = time.time()
+    processed = 0
+    fps = 0
+    bar.update(0, fails=0, fps=0)
     try:
-        processed = 0
-        bar.update(0, fails=0, fps=0)
         while True:
             if p.stdout:
                 _ = p.stdout.readline()
+            new_processed = processed
             if out_csv is not None and out_csv.exists():
                 try:
                     with out_csv.open('r', encoding='utf-8', newline='') as f:
@@ -57,8 +59,6 @@ def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional
                     new_processed = max(0, c - 1)
                 except Exception:
                     new_processed = processed
-            else:
-                new_processed = sum(1 for e in os.scandir(work_dir) if e.is_file() and e.name.lower().endswith('.csv'))
             if new_processed != processed:
                 processed = new_processed
                 elapsed = max(1e-6, time.time() - start)
@@ -66,9 +66,9 @@ def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional
                 bar.update(min(processed, total), fails=0, fps=fps)
             if p.poll() is not None:
                 break
-            time.sleep(0.05)
+            time.sleep(0.02)
         rc = p.wait()
-        bar.update(min(processed, total), fails=0)
+        bar.update(min(processed, total), fails=0, fps=fps)
         bar.close()
         return int(rc)
     except KeyboardInterrupt:
@@ -81,29 +81,6 @@ def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional
         finally:
             bar.close()
         return 130
-    finally:
-        try:
-            if p and (p.poll() is None):
-                p.terminate()
-        except Exception:
-            pass
-    except KeyboardInterrupt:
-        try:
-            p.terminate()
-            try:
-                p.wait(timeout=3)
-            except Exception:
-                p.kill()
-        finally:
-            bar.close()
-        return 130
-    finally:
-        try:
-            if p and (p.poll() is None):
-                p.terminate()
-        except Exception:
-            pass
-
 
 def _ensure_repo(repo_dir: Path, download: bool) -> None:
     if repo_dir.exists() and (repo_dir/".git").exists():
@@ -154,8 +131,10 @@ def _inject_env(repo_dir: Path) -> Dict[str,str]:
     env = os.environ.copy()
     env["OF2_HOME"] = str(repo_dir)
     env["PATH"] = str(repo_dir/"build"/"bin") + os.pathsep + str(repo_dir/"bin") + os.pathsep + env.get("PATH", "")
-    env["LD_LIBRARY_PATH"] = str(repo_dir/"build"/"lib") + os.pathsep + "/usr/local/lib" + os.pathsep + env.get("LD_LIBRARY_PATH","")
+    env["LD_LIBRARY_PATH"] = str(repo_dir/"build"/"lib") + os.pathsep + "/usr/local/lib" + os.pathsep + env.get("LD_LIBRARY_PATH", "")
     env["OPENCV_LOG_LEVEL"] = "ERROR"
+    env["GLOG_minloglevel"] = "2"
+    env["QT_LOGGING_RULES"] = "*.debug=false;*.warning=false"
     return env
 
 

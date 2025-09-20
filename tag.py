@@ -24,6 +24,10 @@ SRGB2XYZ = np.array([[0.4124564, 0.3575761, 0.1804375],
                      [0.2126729, 0.7151522, 0.0721750],
                      [0.0193339, 0.1191920, 0.9503041]], dtype=np.float64)
 VERBOSE = os.environ.get("TAG_VERBOSE", "0").strip().lower() in {"1","true","on","yes","y"}
+UPDATE_EVERY = int(os.environ.get("TAG_UPDATE_EVERY", "100"))
+BAR_EVERY = int(os.environ.get("TAG_BAR_EVERY", "10"))
+TEN_MAX = int(os.environ.get("TAG_TEN_SIZE", "256"))
+TEMP_RES = int(os.environ.get("TAG_TEMP_RES", "128"))
 
 def _onoff(v, default=False) -> bool:
     if isinstance(v, bool):
@@ -82,9 +86,9 @@ def _tenengrad(bgr: np.ndarray) -> float:
         return 0.0
     g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     h, w = g.shape[:2]
-    if max(h, w) > 512:
-        scale = 512.0 / max(h, w)
-        g = cv2.resize(g, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+    if max(h, w) > TEN_MAX:
+        scale = float(TEN_MAX) / max(h, w)
+        g = cv2.resize(g, (max(1,int(w*scale)), max(1,int(h*scale))), interpolation=cv2.INTER_AREA)
     gx = cv2.Sobel(g, cv2.CV_64F, 1, 0, ksize=3)
     gy = cv2.Sobel(g, cv2.CV_64F, 0, 1, ksize=3)
     fm = gx*gx + gy*gy
@@ -108,11 +112,17 @@ def _ellipse_mask(H: int, W: int, shrink: float=0.86) -> np.ndarray:
     return m
 
 def _estimate_temp_exposure(bgr: np.ndarray):
-    H, W = bgr.shape[:2]
+    H0, W0 = bgr.shape[:2]
+    if max(H0, W0) > TEMP_RES:
+        s = float(TEMP_RES) / max(H0, W0)
+        bgrs = cv2.resize(bgr, (max(1,int(W0*s)), max(1,int(H0*s))), interpolation=cv2.INTER_AREA)
+    else:
+        bgrs = bgr
+    H, W = bgrs.shape[:2]
     m = _ellipse_mask(H, W, 0.86).astype(bool)
     if not np.any(m):
         return None, "NEUTRAL", "NORMAL"
-    rgb = bgr[..., ::-1].astype(np.float64)/255.0
+    rgb = bgrs[..., ::-1].astype(np.float64)/255.0
     lin = _srgb_to_linear(rgb)
     R, G, B = lin[...,0][m].mean(), lin[...,1][m].mean(), lin[...,2][m].mean()
     X, Y, Z = (SRGB2XYZ @ np.array([R,G,B])).tolist()
@@ -123,7 +133,7 @@ def _estimate_temp_exposure(bgr: np.ndarray):
     L = 0.2126*lin[...,0] + 0.7152*lin[...,1] + 0.0722*lin[...,2]
     Lm = L[m]
     log_avg = float(math.exp(np.log(Lm+1e-6).mean()))
-    sdr = bgr.astype(np.float64)/255.0
+    sdr = bgrs.astype(np.float64)/255.0
     low = float(((sdr[...,0][m] < 0.02).mean() + (sdr[...,1][m] < 0.02).mean() + (sdr[...,2][m] < 0.02).mean())*100/3)
     hi  = float(((sdr[...,0][m] > 0.98).mean() + (sdr[...,1][m] > 0.98).mean() + (sdr[...,2][m] > 0.98).mean())*100/3)
     exp_bin = "OVER" if (hi > 2.0 or log_avg > 0.65) else ("UNDER" if (low > 10.0 and log_avg < 0.08) else "NORMAL")
@@ -265,7 +275,8 @@ def main():
     if total == 0:
         print("TAG: no images under --aligned.")
         return 2
-    print(f"TAG: config use_of3={use_of3} use_mp={use_mp} use_osf={use_osf} use_af={use_af} use_mf={use_mf}")
+    if VERBOSE:
+        print(f"TAG: config use_of3={use_of3} use_mp={use_mp} use_osf={use_osf} use_af={use_af} use_mf={use_mf}")
     src_maps: Dict[str, Dict[str, Dict[str,str]]] = {}
     if use_of3:
         of3a = _read_csv_map(logs/"openface3"/"openface3.csv")
@@ -281,7 +292,8 @@ def main():
         src_maps['af'] = _read_csv_map(logs/"arcface"/"arcface.csv")
     if use_mf:
         src_maps['mf'] = _read_csv_map(logs/"magface"/"magface.csv")
-    print("TAG: sources sizes", {k: len(v) for k,v in src_maps.items()})
+    if VERBOSE:
+        print("TAG: sources sizes", {k: len(v) for k,v in src_maps.items()})
     mp_jaw_list: List[float] = []
     of3_y_deg: List[float] = []
     mp_y_deg: List[float] = []
@@ -317,7 +329,8 @@ def main():
     of3_max = max(of3_y_deg) if of3_y_deg else None
     mp_min = min(mp_y_deg) if mp_y_deg else None
     mp_max = max(mp_y_deg) if mp_y_deg else None
-    print(f"TAG: yaw coverage of3(min={of3_min}, max={of3_max}) mp(min={mp_min}, max={mp_max}) prefer_of3_yaw={prefer_of3_yaw}")
+    if VERBOSE:
+        print(f"TAG: yaw coverage of3(min={of3_min}, max={of3_max}) mp(min={mp_min}, max={mp_max}) prefer_of3_yaw={prefer_of3_yaw}")
     id_vals = []
     for v in (src_maps.get('af', {}) or {}).values():
         s = _to_float(v.get('id_score') or v.get('cos_ref') or v.get('id_conf') or v.get('cos_sim') or v.get('similarity') or v.get('cosine'))
@@ -325,9 +338,11 @@ def main():
     if id_vals:
         id_mode = 'sim'
         id_thresh = float(np.quantile(id_vals, 0.20))
+        if VERBOSE:
         print(f"TAG: arcface id stats n={len(id_vals)} thresh={id_thresh:.3f} min={min(id_vals):.3f} max={max(id_vals):.3f} med={np.median(id_vals):.3f}")
     else:
         id_mode = 'sim'; id_thresh = 0.50
+        if VERBOSE:
         print("TAG: arcface id missing, using default threshold 0.50")
     mag_vals = []
     for v in (src_maps.get('mf', {}) or {}).values():
@@ -335,7 +350,8 @@ def main():
         if q is not None: mag_vals.append(float(q))
     mag_mu = float(np.mean(mag_vals)) if mag_vals else 0.0
     mag_sd = float(np.std(mag_vals)+1e-6) if mag_vals else 1.0
-    print(f"TAG: magface stats n={len(mag_vals)} mean={mag_mu:.3f} std={mag_sd:.3f}")
+    if VERBOSE:
+        print(f"TAG: magface stats n={len(mag_vals)} mean={mag_mu:.3f} std={mag_sd:.3f}")
     (logs/"tag").mkdir(parents=True, exist_ok=True)
     try:
         (logs/"tag"/"calib.json").write_text(json.dumps({
@@ -373,7 +389,8 @@ def main():
     ten_mean = 0.0
     ten_m2 = 0.0
     ten_n = 0
-    print(f"TAG: writing tags to {tags_csv} and manifest to {manifest}")
+    if VERBOSE:
+        print(f"TAG: writing tags to {tags_csv} and manifest to {manifest}")
     with tags_csv.open("w", encoding="utf-8", newline="") as fcsv, manifest.open("a", encoding="utf-8") as outm:
         wr = csv.writer(fcsv)
         wr.writerow(["file","gaze_bin","eyes_bin","mouth_bin","smile_bin","emotion_bin","yaw_bin","pitch_bin","id_bin","quality_bin","temp_bin","exposure_bin","cleanup_ok","reasons"])
@@ -491,20 +508,24 @@ def main():
                 fps = int(processed/elapsed) if elapsed > 0 else 0
                 eta = int((total-processed)/max(1, fps))
                 eta_s = f"{eta//60:02d}:{eta%60:02d}"
-                tbl = render_bin_table('TAG', {'processed':processed,'total':total,'fails':fails}, sections,
-                                       dupe_totals=None, dedupe_on=True, fps=fps, eta=eta_s)
-                write_bin_table(logs, tbl)
-                bar.update(processed, fails=fails, fps=fps)
+                if (processed % UPDATE_EVERY == 0) or (processed == total):
+                    tbl = render_bin_table('TAG', {'processed':processed,'total':total,'fails':fails}, sections,
+                                           dupe_totals=None, dedupe_on=True, fps=fps, eta=eta_s)
+                    write_bin_table(logs, tbl)
+                if (processed % BAR_EVERY == 0) or (processed == total):
+                    bar.update(processed, fails=fails, fps=fps)
             except Exception as e:
                 fails += 1
                 processed += 1
                 elapsed = time.time() - t0
                 fps = int(processed/elapsed) if elapsed > 0 else 0
+                if (processed % BAR_EVERY == 0) or (processed == total):
                 bar.update(processed, fails=fails, fps=fps)
-                print(f"TAG: error on {fn}: {e}")
+            print(f"TAG: error on {fn}: {e}")
     bar.close()
-    print(f"TAG: done. images={total} fails={fails} manifest={manifest}")
-    print("TAG: final counts")
+    if VERBOSE:
+        print(f"TAG: done. images={total} fails={fails} manifest={manifest}")
+        print("TAG: final counts")
     try:
         for k in ['GAZE','EYES','MOUTH','SMILE','EMOTION','YAW','PITCH','IDENTITY','QUALITY','TEMP','EXPOSURE']:
             print(f"TAG: {k} -> {sections[k]['counts']}")

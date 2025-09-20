@@ -62,9 +62,10 @@ def _overlay(im: Image.Image, label: str, file: str, yaw: float | None, pitch: f
     draw.text((6, H - bar_h + 3), txt, fill=(235, 235, 235), font=font)
     if yaw is not None or pitch is not None:
         ptxt = f"yaw={yaw:.1f} pitch={pitch:.1f}"
-        w, h = draw.textsize(ptxt, font=font)
-        draw.rectangle([W - w - 8, 0, W, h + 6], fill=(0, 0, 0, 160))
-        draw.text((W - w - 4, 3), ptxt, fill=(235, 235, 235), font=font)
+        bbox = draw.textbbox((0, 0), ptxt, font=font)
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.rectangle([W - w - 10, 2, W - 2, 2 + h + 4], fill=(0, 0, 0, 160))
+        draw.text((W - w - 8, 4), ptxt, fill=(235, 235, 235), font=font)
 
 
 def _safe_name(s: str) -> str:
@@ -110,7 +111,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--aligned", required=True, type=Path)
     ap.add_argument("--logs", required=True, type=Path)
-    ap.add_argument("--per_bin", type=int, default=12)
+    ap.add_argument("--per_bin", type=int, default=0)
     ap.add_argument("--grid", type=str, default="6x2")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cats", type=str, default=",")  # comma-separated subset of CATS
@@ -143,6 +144,7 @@ def main():
         gc, gr = (int(x) for x in args.grid.lower().split('x'))
     except Exception:
         gc, gr = 6, 2
+    per_bin = args.per_bin if args.per_bin and args.per_bin > 0 else (gc * gr)
 
     out_dir = logs / "preview"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -157,7 +159,7 @@ def main():
             if cat not in allowed:
                 continue
             for lbl, xs in (by.get(cat) or {}).items():
-                sel = _pick_random(xs, args.per_bin)
+                sel = _pick_random(xs, per_bin)
                 pairs = [(d['_path'], lbl, d) for d in sel]
                 safe_lbl = _safe_name(lbl)
                 grid_path = out_dir / f"{cat}__{safe_lbl}.jpg"

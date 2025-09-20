@@ -338,7 +338,7 @@ def main():
                     bar2.update(processed, fails=fails)
                     continue
                 seen.add(key)
-                row = [r.get(k) for k in header]
+                row = [r.get(k, None) for k in header]
                 wr.writerow(row)
                 processed += 1
                 fps = int(processed/max(1,int(time.time()-t0)))

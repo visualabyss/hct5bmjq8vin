@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 import os, sys, csv, json, argparse, subprocess, time
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 import math
 from progress import ProgressBar
 
@@ -46,14 +46,9 @@ def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
     start = time.time()
     last_tick = 0.0
-    processed = 0
     try:
         while True:
             line = p.stdout.readline() if p.stdout else ""
-            if line:
-                L = line.rstrip()
-                if ("warn" in L.lower()):
-                    L = ""
             now = time.time()
             if (now - last_tick) >= 1.0:
                 processed = _count_rows(work_dir)
@@ -133,7 +128,16 @@ def _rad2deg(x: Optional[float]) -> Optional[float]:
     except Exception: return None
 
 
-def _read_of_csv(csv_path: Path, files: List[Path]) -> List[Dict[str,object]]:
+def _discover_fields(csv_path: Path) -> Tuple[List[str], List[str]]:
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        rd = csv.DictReader(f)
+        flds = rd.fieldnames or []
+    au_cols = [c for c in flds if c.startswith("AU") and c.endswith("_r")]
+    gaze_extra = [c for c in flds if c.startswith("gaze_") and not c.startswith("gaze_angle")]
+    return au_cols, gaze_extra
+
+
+def _read_of_csv(csv_path: Path, files: List[Path], au_cols: List[str], gaze_extra: List[str]) -> List[Dict[str,object]]:
     rows = []
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         rd = csv.DictReader(f)
@@ -147,7 +151,7 @@ def _read_of_csv(csv_path: Path, files: List[Path]) -> List[Dict[str,object]]:
             roll = _rad2deg(float(r.get("pose_Rz"))) if r.get("pose_Rz") not in (None, "") else None
             gx = _rad2deg(float(r.get("gaze_angle_x"))) if r.get("gaze_angle_x") not in (None, "") else None
             gy = _rad2deg(float(r.get("gaze_angle_y"))) if r.get("gaze_angle_y") not in (None, "") else None
-            out = {
+            out: Dict[str, object] = {
                 "file": Path(name).name,
                 "yaw": yaw,
                 "pitch": pitch,
@@ -156,10 +160,13 @@ def _read_of_csv(csv_path: Path, files: List[Path]) -> List[Dict[str,object]]:
                 "gaze_y": gy,
                 "success": int(float(r.get("success", 0))) if r.get("success") not in (None, "") else 0,
                 "confidence": float(r.get("confidence", 0.0)) if r.get("confidence") not in (None, "") else 0.0,
-                "AU45_r": (float(r.get("AU45_r")) if r.get("AU45_r") not in (None, "") else None),
-                "AU25_r": (float(r.get("AU25_r")) if r.get("AU25_r") not in (None, "") else None),
-                "AU26_r": (float(r.get("AU26_r")) if r.get("AU26_r") not in (None, "") else None),
             }
+            for c in au_cols:
+                v = r.get(c)
+                out[c] = float(v) if v not in (None, "") else None
+            for c in gaze_extra:
+                v = r.get(c)
+                out[c] = float(v) if v not in (None, "") else None
             rows.append(out)
     return rows
 
@@ -200,15 +207,13 @@ def main():
         print("[OF2] no images under --aligned")
         return 2
 
-    prefer = "FaceLandmarkImg" if args.img_tool in ("auto","img") else "FeatureExtraction"
+    prefer = "FeatureExtraction"  # force CSV-streaming tool
     bin_user = Path(args.binary) if args.binary else None
     bin_path = _find_binary(repo_dir, bin_user, prefer)
-    if (not bin_path) and prefer=="FaceLandmarkImg":
-        bin_path = _find_binary(repo_dir, bin_user, "FeatureExtraction")
     if not bin_path:
         print("[OF2] building OpenFace...")
         _ensure_built(repo_dir)
-        bin_path = _find_binary(repo_dir, None, prefer) or _find_binary(repo_dir, None, "FeatureExtraction")
+        bin_path = _find_binary(repo_dir, None, prefer)
     if not bin_path:
         print("[OF2] ERROR: OpenFace binary not found. Build failed or wrong platform.")
         return 3
@@ -228,10 +233,12 @@ def main():
         print("[OF2] ERROR: no CSV produced under", work_dir)
         return 4
 
+    au_cols, gaze_extra = _discover_fields(csv_files[0])
+
     rows: List[Dict[str,object]] = []
     for c in csv_files:
         try:
-            rows.extend(_read_of_csv(c, images))
+            rows.extend(_read_of_csv(c, images, au_cols, gaze_extra))
         except Exception:
             pass
 
@@ -245,10 +252,12 @@ def main():
     bar2 = ProgressBar("OF2-MERGE", total=total_rows, show_fail_label=True)
     t0 = time.time(); processed=0; fails=0
     write_header = not out_csv.exists()
+    base_hdr = ["file","yaw","pitch","roll","gaze_x","gaze_y","success","confidence"]
+    header = base_hdr + au_cols + gaze_extra
     with out_csv.open("a", encoding="utf-8", newline="") as f:
         wr = csv.writer(f)
         if write_header:
-            wr.writerow(["file","yaw","pitch","roll","gaze_x","gaze_y","success","confidence","AU45_r","AU25_r","AU26_r"])
+            wr.writerow(header)
         for r in rows:
             try:
                 key = r["file"]
@@ -257,7 +266,8 @@ def main():
                     bar2.update(processed, fails=fails)
                     continue
                 seen.add(key)
-                wr.writerow([r["file"], r["yaw"], r["pitch"], r["roll"], r["gaze_x"], r["gaze_y"], r["success"], r["confidence"], r["AU45_r"], r["AU25_r"], r["AU26_r"]])
+                row = [r.get(k) for k in base_hdr] + [r.get(c) for c in au_cols] + [r.get(c) for c in gaze_extra]
+                wr.writerow(row)
                 processed += 1
                 fps = int(processed/max(1,int(time.time()-t0)))
                 bar2.update(processed, fails=fails, fps=fps)
@@ -274,6 +284,8 @@ def main():
         "per_image": str(work_dir),
         "count": len(seen),
         "binary": str(bin_path),
+        "au_cols": au_cols,
+        "gaze_extra": gaze_extra,
     }
     (out_root/"of2_meta.json").write_text(json.dumps(meta, indent=2), encoding='utf-8')
     print(f"[OF2] done rows={len(seen)} -> {out_csv}")

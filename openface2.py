@@ -7,6 +7,8 @@ import math
 from progress import ProgressBar
 import shutil
 
+VERBOSE = os.environ.get("OF2_VERBOSE", "0").strip().lower() in {"1","true","on","yes","y"}
+
 IMAGE_EXTS = {".jpg",".jpeg",".png",".bmp",".webp"}
 
 AUTO_HELP = r"""
@@ -181,17 +183,21 @@ def _rad2deg(x: Optional[float]) -> Optional[float]:
     except Exception: return None
 
 
-def _discover_fields(csv_path: Path) -> Tuple[List[str], List[str]]:
+def _discover_fields(csv_path: Path) -> Tuple[List[str], List[str], List[str], List[str], bool, bool]:
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         rd = csv.DictReader(f)
         flds = rd.fieldnames or []
-    au_cols = [c for c in flds if c.startswith("AU") and c.endswith("_r")]
-    gaze_extra = [c for c in flds if c.startswith("gaze_") and not c.startswith("gaze_angle")]
-    return au_cols, gaze_extra
+    au_r_cols = [c for c in flds if c.startswith("AU") and c.endswith("_r")]
+    au_c_cols = [c for c in flds if c.startswith("AU") and c.endswith("_c")]
+    gaze_cols = [c for c in flds if c.startswith("gaze_")]
+    pose_cols = [c for c in flds if c.startswith("pose_")]
+    has_frame = ("frame" in flds)
+    has_ts = ("timestamp" in flds)
+    return au_r_cols, au_c_cols, gaze_cols, pose_cols, has_frame, has_ts
 
 
-def _read_of_csv(csv_path: Path, files: List[Path], au_cols: List[str], gaze_extra: List[str]) -> List[Dict[str,object]]:
-    rows = []
+def _read_of_csv(csv_path: Path, files: List[Path], au_r_cols: List[str], au_c_cols: List[str], gaze_cols: List[str], pose_cols: List[str]) -> List[Dict[str,object]]:
+    rows: List[Dict[str,object]] = []
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         rd = csv.DictReader(f)
         fns = [p.name for p in files]
@@ -199,27 +205,32 @@ def _read_of_csv(csv_path: Path, files: List[Path], au_cols: List[str], gaze_ext
             name = r.get("input") or r.get("filename")
             if not name:
                 name = fns[i] if i < len(fns) else str(i)
-            yaw = _rad2deg(float(r.get("pose_Ry"))) if r.get("pose_Ry") not in (None, "") else None
-            pitch = _rad2deg(float(r.get("pose_Rx"))) if r.get("pose_Rx") not in (None, "") else None
-            roll = _rad2deg(float(r.get("pose_Rz"))) if r.get("pose_Rz") not in (None, "") else None
-            gx = _rad2deg(float(r.get("gaze_angle_x"))) if r.get("gaze_angle_x") not in (None, "") else None
-            gy = _rad2deg(float(r.get("gaze_angle_y"))) if r.get("gaze_angle_y") not in (None, "") else None
-            out: Dict[str, object] = {
-                "file": Path(name).name,
-                "yaw": yaw,
-                "pitch": pitch,
-                "roll": roll,
-                "gaze_x": gx,
-                "gaze_y": gy,
+            # angles in radians -> deg
+            yaw_deg = _rad2deg(float(r.get("pose_Ry"))) if r.get("pose_Ry") not in (None, "") else None
+            pitch_deg = _rad2deg(float(r.get("pose_Rx"))) if r.get("pose_Rx") not in (None, "") else None
+            roll_deg = _rad2deg(float(r.get("pose_Rz"))) if r.get("pose_Rz") not in (None, "") else None
+            out: Dict[str, object] = {"file": Path(name).name,
+                "yaw_deg": yaw_deg, "pitch_deg": pitch_deg, "roll_deg": roll_deg,
                 "success": int(float(r.get("success", 0))) if r.get("success") not in (None, "") else 0,
-                "confidence": float(r.get("confidence", 0.0)) if r.get("confidence") not in (None, "") else 0.0,
-            }
-            for c in au_cols:
+                "confidence": float(r.get("confidence", 0.0)) if r.get("confidence") not in (None, "") else 0.0}
+            # frame/timestamp if present
+            if "frame" in r: out["frame"] = int(float(r.get("frame")))
+            if "timestamp" in r: out["timestamp"] = float(r.get("timestamp"))
+            # copy pose raw values
+            for c in pose_cols:
                 v = r.get(c)
                 out[c] = float(v) if v not in (None, "") else None
-            for c in gaze_extra:
+            # gaze vectors/angles
+            for c in gaze_cols:
                 v = r.get(c)
                 out[c] = float(v) if v not in (None, "") else None
+            # AU intensities and classes
+            for c in au_r_cols:
+                v = r.get(c)
+                out[c] = float(v) if v not in (None, "") else None
+            for c in au_c_cols:
+                v = r.get(c)
+                out[c] = int(float(v)) if v not in (None, "") else None
             rows.append(out)
     return rows
 
@@ -264,15 +275,18 @@ def main():
     env = _inject_env(repo_dir)
 
     images = _list_images(aligned)
-    print(f"[OF2] images={len(images)} aligned={aligned}")
+    if VERBOSE:
+        print(f"[OF2] images={len(images)} aligned={aligned}")
     if not images:
-        print("[OF2] no images under --aligned")
+        if VERBOSE:
+            print("[OF2] no images under --aligned")
         return 2
 
     prefer = "FeatureExtraction"  # use sequence tool for -fdir so we can tail a single CSV
     bin_user = Path(args.binary) if args.binary else None
     bin_path = _find_binary(repo_dir, bin_user, prefer)
     if not bin_path:
+        if VERBOSE:
         print("[OF2] building OpenFace...")
         _ensure_built(repo_dir)
         bin_path = _find_binary(repo_dir, None, prefer)
@@ -284,7 +298,8 @@ def main():
     cmd = [str(bin_path), "-fdir", str(aligned), "-out_dir", str(work_dir), "-pose", "-gaze", "-aus", "-au_static", "-of", out_name]
     if args.extra_args.strip():
         cmd += args.extra_args.strip().split()
-    print("[OF2] running:", " ".join(cmd))
+    if VERBOSE:
+        print("[OF2] running:", " ".join(cmd))
 
     try:
         rc = _run_with_progress(cmd, work_dir, total=len(images), env=env, aligned_name=aligned.name, force_of=out_name)
@@ -300,12 +315,12 @@ def main():
         print("[OF2] ERROR: no CSV produced under", work_dir)
         return 4
 
-    au_cols, gaze_extra = _discover_fields(csv_files[0])
+    au_r_cols, au_c_cols, gaze_cols, pose_cols, has_frame, has_ts = _discover_fields(csv_files[0])
 
     rows: List[Dict[str,object]] = []
     for c in csv_files:
         try:
-            rows.extend(_read_of_csv(c, images, au_cols, gaze_extra))
+            rows.extend(_read_of_csv(c, images, au_r_cols, au_c_cols, gaze_cols, pose_cols))
         except Exception:
             pass
 
@@ -319,8 +334,8 @@ def main():
     bar2 = ProgressBar("OF2-MERGE", total=total_rows, show_fail_label=True)
     t0 = time.time(); processed=0; fails=0
     write_header = not out_csv.exists()
-    base_hdr = ["file","yaw","pitch","roll","gaze_x","gaze_y","success","confidence"]
-    header = base_hdr + au_cols + gaze_extra
+    base_hdr = ["file"] + (["frame"] if has_frame else []) + (["timestamp"] if has_ts else []) + ["success","confidence","yaw_deg","pitch_deg","roll_deg"]
+    header = base_hdr + pose_cols + gaze_cols + au_r_cols + au_c_cols
     with out_csv.open("a", encoding="utf-8", newline="") as f:
         wr = csv.writer(f)
         if write_header:
@@ -333,7 +348,7 @@ def main():
                     bar2.update(processed, fails=fails)
                     continue
                 seen.add(key)
-                row = [r.get(k) for k in base_hdr] + [r.get(c) for c in au_cols] + [r.get(c) for c in gaze_extra]
+                row = [r.get(k) for k in header]
                 wr.writerow(row)
                 processed += 1
                 fps = int(processed/max(1,int(time.time()-t0)))

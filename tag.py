@@ -25,7 +25,7 @@ SRGB2XYZ = np.array([[0.4124564, 0.3575761, 0.1804375],
                      [0.0193339, 0.1191920, 0.9503041]], dtype=np.float64)
 VERBOSE = os.environ.get("TAG_VERBOSE", "0").strip().lower() in {"1","true","on","yes","y"}
 UPDATE_EVERY = int(os.environ.get("TAG_UPDATE_EVERY", "100"))
-BAR_EVERY = int(os.environ.get("TAG_BAR_EVERY", "10"))
+BAR_EVERY = int(os.environ.get("TAG_BAR_EVERY", "1"))
 TEN_MAX = int(os.environ.get("TAG_TEN_SIZE", "256"))
 TEMP_RES = int(os.environ.get("TAG_TEMP_RES", "128"))
 
@@ -339,11 +339,11 @@ def main():
         id_mode = 'sim'
         id_thresh = float(np.quantile(id_vals, 0.20))
         if VERBOSE:
-        print(f"TAG: arcface id stats n={len(id_vals)} thresh={id_thresh:.3f} min={min(id_vals):.3f} max={max(id_vals):.3f} med={np.median(id_vals):.3f}")
+            print(f"TAG: arcface id stats n={len(id_vals)} thresh={id_thresh:.3f} min={min(id_vals):.3f} max={max(id_vals):.3f} med={np.median(id_vals):.3f}")
     else:
         id_mode = 'sim'; id_thresh = 0.50
         if VERBOSE:
-        print("TAG: arcface id missing, using default threshold 0.50")
+            print("TAG: arcface id missing, using default threshold 0.50")
     mag_vals = []
     for v in (src_maps.get('mf', {}) or {}).values():
         q = _to_float(v.get('quality') or v.get('mag') or v.get('mag_norm') or v.get('mag_quality'))
@@ -512,19 +512,15 @@ def main():
                     tbl = render_bin_table('TAG', {'processed':processed,'total':total,'fails':fails}, sections,
                                            dupe_totals=None, dedupe_on=True, fps=fps, eta=eta_s)
                     write_bin_table(logs, tbl)
-                if (processed % BAR_EVERY == 0) or (processed == total):
-                    bar.update(processed, fails=fails, fps=fps)
+                bar.update(processed, fails=fails, fps=fps)
             except Exception as e:
                 fails += 1
                 processed += 1
                 elapsed = time.time() - t0
                 fps = int(processed/elapsed) if elapsed > 0 else 0
-                if (processed % BAR_EVERY == 0) or (processed == total):
                 bar.update(processed, fails=fails, fps=fps)
-            print(f"TAG: error on {fn}: {e}")
-    bar.close()
-    if VERBOSE:
-        print(f"TAG: done. images={total} fails={fails} manifest={manifest}")
+                if VERBOSE:
+                    print(f"TAG: error on {fn}: {e}")} fails={fails} manifest={manifest}")
         print("TAG: final counts")
     try:
         for k in ['GAZE','EYES','MOUTH','SMILE','EMOTION','YAW','PITCH','IDENTITY','QUALITY','TEMP','EXPOSURE']:

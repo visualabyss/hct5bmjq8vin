@@ -1,0 +1,100 @@
+name: AI Edits from Comment
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  # Comma-separated GitHub usernames allowed to trigger edits
+  ALLOWLIST: "visualabyss"
+  # Only allow changes inside these top-level folders
+  ALLOWED_TOPS: "scripts,tools"
+
+jobs:
+  run:
+    if: startsWith(github.event.comment.body, '/replace') || startsWith(github.event.comment.body, '/apply')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check author allowlist
+        run: |
+          ALLOW="${{ env.ALLOWLIST }}"
+          ACTOR="${{ github.event.comment.user.login }}"
+          if ! echo ",$ALLOW," | grep -qi ",$ACTOR," ; then
+            echo "Not allowed: $ACTOR"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse command
+        id: parse
+        run: |
+          set -e
+          body=$(cat <<'EOF'
+          ${{ github.event.comment.body }}
+          EOF
+          )
+          code="$(printf "%s" "$body" | awk '/^```/{flag=!flag;next}flag')"
+          if printf "%s" "$body" | head -1 | grep -q '^/replace'; then
+            echo "mode=replace" >> $GITHUB_OUTPUT
+            path=$(printf "%s" "$body" | head -1 | awk '{print $2}')
+            echo "path=$path" >> $GITHUB_OUTPUT
+            printf "%s" "$code" > payload.txt
+          elif printf "%s" "$body" | head -1 | grep -q '^/apply'; then
+            echo "mode=apply" >> $GITHUB_OUTPUT
+            printf "%s" "$code" > change.patch
+          else
+            echo "Unknown command"; exit 1
+          fi
+
+      - name: Enforce allowed paths (replace)
+        if: steps.parse.outputs.mode == 'replace'
+        run: |
+          set -e
+          path="${{ steps.parse.outputs.path }}"
+          top="${path%%/*}"
+          if ! echo ",${{ env.ALLOWED_TOPS }}," | grep -q ",$top," ; then
+            echo "::error::Forbidden path: $path"; exit 1
+          fi
+          mkdir -p "$(dirname "$path")"
+          cp payload.txt "$path"
+
+      - name: Apply diff (apply)
+        if: steps.parse.outputs.mode == 'apply'
+        run: |
+          set -e
+          git apply --reject --whitespace=fix change.patch || true
+          git add -A
+          CHANGED=$(git diff --cached --name-only || true)
+          if [ -z "$CHANGED" ]; then
+            echo "No changes staged."; exit 1
+          fi
+          BAD=$(echo "$CHANGED" | awk -F/ '{print $1}' | grep -Ev '^(scripts|tools)$' || true)
+          if [ -n "$BAD" ]; then
+            echo "::error::Patch touches forbidden paths:"; echo "$BAD"; exit 1
+          fi
+
+      - name: Commit
+        run: |
+          set -e
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"; exit 1
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "AI edit from comment ${{ github.event.comment.html_url }}"
+
+      - name: Open PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          title: "AI edit: ${{ github.event.comment.id }}"
+          body: "Automated edit from ${{ github.event.comment.html_url }}"
+          branch: "bot/ai-edit-${{ github.event.comment.id }}"
+          base: main

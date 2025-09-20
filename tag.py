@@ -224,8 +224,8 @@ def main():
     ap.add_argument('--openface3',   default='off')
     ap.add_argument('--mediapipe',   default='off')
     ap.add_argument('--openseeface', default='off')
-    ap.add_argument('--arcface',     default='off')
-    ap.add_argument('--magface',     default='off')
+    ap.add_argument('--arcface',     default='on')
+    ap.add_argument('--magface',     default='on')
     ap.add_argument('--override', action='store_true')
     ap.add_argument('--help', dest='auto_help', default='on')
     args = ap.parse_args()
@@ -325,11 +325,11 @@ def main():
     if id_vals:
         id_mode = 'sim'
         id_thresh = float(np.quantile(id_vals, 0.20))
-        if VERBOSE:
+        if VERBOSE and use_af:
             print(f"TAG: arcface id stats n={len(id_vals)} thresh={id_thresh:.3f} min={min(id_vals):.3f} max={max(id_vals):.3f} med={np.median(id_vals):.3f}")
     else:
         id_mode = 'sim'; id_thresh = 0.50
-        if VERBOSE:
+        if VERBOSE and use_af:
             print("TAG: arcface id missing, using default threshold 0.50")
 
     mag_vals = []
@@ -339,7 +339,7 @@ def main():
             if q is not None: mag_vals.append(float(q))
     mag_mu = float(np.mean(mag_vals)) if mag_vals else 0.0
     mag_sd = float(np.std(mag_vals)+1e-6) if mag_vals else 1.0
-    if VERBOSE:
+    if VERBOSE and use_mf:
         print(f"TAG: magface stats n={len(mag_vals)} mean={mag_mu:.3f} std={mag_sd:.3f}")
 
     (logs/"tag").mkdir(parents=True, exist_ok=True)
@@ -374,6 +374,10 @@ def main():
         }
 
     sections = init_counts()
+    if not use_af:
+        sections.pop('IDENTITY', None)
+    if not use_mf:
+        sections.pop('QUALITY', None)
     bar = ProgressBar('TAG', total=total, show_fail_label=True)
     processed = 0; fails = 0; t0 = time.time()
 
@@ -390,7 +394,11 @@ def main():
 
     with tags_csv.open("w", encoding="utf-8", newline="") as fcsv, manifest.open("a", encoding="utf-8") as outm:
         wr = csv.writer(fcsv)
-        wr.writerow(["file","gaze_bin","eyes_bin","mouth_bin","smile_bin","emotion_bin","yaw_bin","pitch_bin","id_bin","quality_bin","temp_bin","exposure_bin","cleanup_ok","reasons"])
+        hdr = ["file","gaze_bin","eyes_bin","mouth_bin","smile_bin","emotion_bin","yaw_bin","pitch_bin"]
+        if use_af: hdr.append("id_bin")
+        if use_mf: hdr.append("quality_bin")
+        hdr += ["temp_bin","exposure_bin","cleanup_ok","reasons"]
+        wr.writerow(hdr)
         for img in img_list:
             fn = img.name
             try:
@@ -462,7 +470,7 @@ def main():
                 if gy_of2 is not None or gp_of2 is not None:
                     gaze_bin = _gaze_bin(gy_of2, gp_of2)
                 else:
-                    gaze_bin = _gaze_bin(yaw, pitch)
+                    gaze_bin = "FRONT"
 
                 if use_of2 and of2:
                     eyes_bin = _eyes_state_from_of2(of2)
@@ -485,12 +493,21 @@ def main():
                     pass
 
                 cleanup_ok, reasons = True, ""
-                for k, v in [("GAZE",gaze_bin),("EYES",eyes_bin),("MOUTH",m_bin),("SMILE",s_bin),("EMOTION",emo_lbl),
-                             ("YAW",_yaw_bin(yaw)),("PITCH",_pitch_bin(pitch)),("IDENTITY",id_bin),("QUALITY",q_bin),
-                             ("TEMP",temp_bin),("EXPOSURE",exp_bin)]:
+                pairs = [("GAZE",gaze_bin),("EYES",eyes_bin),("MOUTH",m_bin),("SMILE",s_bin),("EMOTION",emo_lbl),
+                             ("YAW",_yaw_bin(yaw)),("PITCH",_pitch_bin(pitch)),
+                             ("TEMP",temp_bin),("EXPOSURE",exp_bin)]
+                if 'IDENTITY' in sections:
+                    pairs.append(("IDENTITY", id_bin))
+                if 'QUALITY' in sections:
+                    pairs.append(("QUALITY", q_bin))
+                for k, v in pairs:
                     sections[k]['counts'][v] += 1
 
-                wr.writerow([fn, gaze_bin, eyes_bin, m_bin, s_bin, emo_lbl, _yaw_bin(yaw), _pitch_bin(pitch), id_bin, q_bin, temp_bin, exp_bin, int(cleanup_ok), reasons])
+                row = [fn, gaze_bin, eyes_bin, m_bin, s_bin, emo_lbl, _yaw_bin(yaw), _pitch_bin(pitch)]
+                if use_af: row.append(id_bin)
+                if use_mf: row.append(q_bin)
+                row += [temp_bin, exp_bin, int(cleanup_ok), reasons]
+                wr.writerow(row)
 
                 pose_center = float(np.clip(1.0 - (abs((yaw or 0.0))/55.0 + abs((pitch or 0.0))/25.0), 0.0, 1.0))
                 expr_bonus = float(smile_val)
@@ -501,19 +518,7 @@ def main():
 
                 rec = {
                     'file': fn,
-                    'bins': {
-                        'GAZE': gaze_bin,
-                        'EYES': eyes_bin,
-                        'MOUTH': m_bin,
-                        'SMILE': s_bin,
-                        'EMOTION': emo_lbl,
-                        'YAW': _yaw_bin(yaw),
-                        'PITCH': _pitch_bin(pitch),
-                        'IDENTITY': id_bin,
-                        'QUALITY': q_bin,
-                        'TEMP': temp_bin,
-                        'EXPOSURE': exp_bin,
-                    },
+                    'bins': (lambda: (lambda d: (d.update({'IDENTITY': id_bin}) or d) if use_af else d)((lambda d2: (d2.update({'QUALITY': q_bin}) or d2) if use_mf else d2)({'GAZE': gaze_bin,'EYES': eyes_bin,'MOUTH': m_bin,'SMILE': s_bin,'EMOTION': emo_lbl,'YAW': _yaw_bin(yaw),'PITCH': _pitch_bin(pitch),'TEMP': temp_bin,'EXPOSURE': exp_bin})))(),
                     'scores': {
                         'id_score': id_score,
                         'q_score': q_score,
@@ -557,7 +562,7 @@ def main():
         print(f"TAG: done. images={total} fails={fails} manifest={manifest}")
         print("TAG: final counts")
     try:
-        for k in ['GAZE','EYES','MOUTH','SMILE','EMOTION','YAW','PITCH','IDENTITY','QUALITY','TEMP','EXPOSURE']:
+        for k in sections.keys():
             print(f"TAG: {k} -> {sections[k]['counts']}")
     except Exception:
         pass

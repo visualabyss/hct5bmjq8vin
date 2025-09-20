@@ -230,9 +230,6 @@ def _pitch_bin(pitch_deg: Optional[float]) -> str:
     if pitch_deg >= 10: return "CHIN UP"
     if pitch_deg <= -10: return "CHIN DOWN"
     return "LEVEL"
-    if pitch_deg >= 15: return "CHIN UP"
-    if pitch_deg <= -15: return "CHIN DOWN"
-    return "LEVEL"
 
 def _quality_bin_from_score(qs: float) -> str:
     if qs >= 0.75: return "HIGH"
@@ -520,7 +517,10 @@ def main():
                 fps = int(processed/elapsed) if elapsed > 0 else 0
                 bar.update(processed, fails=fails, fps=fps)
                 if VERBOSE:
-                    print(f"TAG: error on {fn}: {e}")} fails={fails} manifest={manifest}")
+                    print(f"TAG: error on {fn}: {e}")
+    bar.close()
+    if VERBOSE:
+        print(f"TAG: done. images={total} fails={fails} manifest={manifest}")
         print("TAG: final counts")
     try:
         for k in ['GAZE','EYES','MOUTH','SMILE','EMOTION','YAW','PITCH','IDENTITY','QUALITY','TEMP','EXPOSURE']:

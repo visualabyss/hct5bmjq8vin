@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Tuple
 import math
 from progress import ProgressBar
+import shutil
 
 IMAGE_EXTS = {".jpg",".jpeg",".png",".bmp",".webp"}
 
@@ -30,14 +31,12 @@ def _list_images(d: Path) -> List[Path]:
 
 def _count_rows(work_dir: Path) -> int:
     total = 0
-    for p in work_dir.rglob('*.csv'):
-        try:
-            with p.open('r', encoding='utf-8', newline='') as f:
-                n = sum(1 for _ in f)
-                if n > 1:
-                    total += (n - 1)
-        except Exception:
-            pass
+    for e in os.scandir(work_dir):
+        if not e.is_file():
+            continue
+        if not e.name.lower().endswith('.csv'):
+            continue
+        total += 1
     return total
 
 
@@ -45,27 +44,55 @@ def _run_with_progress(cmd: List[str], work_dir: Path, total: int, env: Optional
     bar = ProgressBar("OPENFACE2", total=total, show_fail_label=True)
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env)
     start = time.time()
-    last_tick = 0.0
+    seen: set = set()
+    # baseline: do not count pre-existing files as progress
+    for e in os.scandir(work_dir):
+        if e.is_file() and e.name.lower().endswith('.csv'):
+            seen.add(e.name)
+    processed = len(seen)
+    bar.update(min(processed, total), fails=0, fps=0)
     try:
         while True:
-            line = p.stdout.readline() if p.stdout else ""
-            now = time.time()
-            if (now - last_tick) >= 1.0:
-                processed = _count_rows(work_dir)
-                fps = int(processed/max(1, int(now - start)))
+            # swallow tool output to keep console quiet
+            if p.stdout:
+                _ = p.stdout.readline()
+            # detect new per-image CSVs
+            new_cnt = 0
+            for e in os.scandir(work_dir):
+                if not e.is_file():
+                    continue
+                if not e.name.lower().endswith('.csv'):
+                    continue
+                if e.name not in seen:
+                    seen.add(e.name)
+                    new_cnt += 1
+            if new_cnt:
+                processed += new_cnt
+                elapsed = max(1e-6, time.time() - start)
+                fps = int(processed / elapsed)
                 bar.update(min(processed, total), fails=0, fps=fps)
-                last_tick = now
-            if not line and p.poll() is not None:
+            if p.poll() is not None:
                 break
+            time.sleep(0.02)
         rc = p.wait()
-        processed = _count_rows(work_dir)
-        fps = int(processed/max(1, int(time.time() - start)))
-        bar.update(min(processed, total), fails=0, fps=fps)
         bar.close()
         return int(rc)
+    except KeyboardInterrupt:
+        try:
+            p.terminate()
+            try:
+                p.wait(timeout=3)
+            except Exception:
+                p.kill()
+        finally:
+            bar.close()
+        return 130
     finally:
-        try: bar.close()
-        except Exception: pass
+        try:
+            if p and (p.poll() is None):
+                p.terminate()
+        except Exception:
+            pass
 
 
 def _ensure_repo(repo_dir: Path, download: bool) -> None:
@@ -196,6 +223,15 @@ def main():
     logs = Path(args.logs)
     out_root = logs/"openface2"; out_root.mkdir(parents=True, exist_ok=True)
     work_dir = out_root/"per_image"; work_dir.mkdir(parents=True, exist_ok=True)
+    if args.override:
+        for e in list(os.scandir(work_dir)):
+            try:
+                if e.is_file():
+                    os.unlink(e.path)
+                elif e.is_dir():
+                    shutil.rmtree(e.path)
+            except Exception:
+                pass
     repo_dir = Path(os.environ.get("OF2_HOME", "/workspace/tools/OpenFace"))
 
     _ensure_repo(repo_dir, _onoff(args.download, True))
@@ -223,7 +259,11 @@ def main():
         cmd += args.extra_args.strip().split()
     print("[OF2] running:", " ".join(cmd))
 
-    rc = _run_with_progress(cmd, work_dir, total=len(images), env=env)
+    try:
+        rc = _run_with_progress(cmd, work_dir, total=len(images), env=env)
+    except KeyboardInterrupt:
+        print("[OF2] interrupted")
+        return 130
     if rc != 0:
         print("[OF2] ERROR: tool failed")
         return rc
